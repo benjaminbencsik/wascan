@@ -2,3 +2,8 @@ aiohttp
 beautifulsoup4
 lxml
 playwright
+pytest
+pytest-asyncio
+fastapi
+uvicorn
+jinja2
