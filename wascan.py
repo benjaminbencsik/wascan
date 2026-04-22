@@ -22,6 +22,7 @@ import sqlite3
 import subprocess
 import urllib.parse
 import html as html_escape
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -32,6 +33,49 @@ from typing import Optional
 
 import aiohttp
 from bs4 import BeautifulSoup
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+BLACK = "\033[30m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+BLUE = "\033[34m"
+MAGENTA = "\033[35m"
+CYAN = "\033[36m"
+WHITE = "\033[37m"
+BRIGHT_BLACK = "\033[90m"
+BRIGHT_RED = "\033[91m"
+BRIGHT_GREEN = "\033[92m"
+BRIGHT_YELLOW = "\033[93m"
+BRIGHT_BLUE = "\033[94m"
+BRIGHT_MAGENTA = "\033[95m"
+BRIGHT_CYAN = "\033[96m"
+BRIGHT_WHITE = "\033[97m"
+RESET = "\033[0m"
+BOLD = "\033[1m"
+
+SPINNER_FRAMES = ["Γáï", "ΓáÖ", "Γá╣", "Γá╕", "Γá╝", "Γá┤", "Γáª", "Γáº", "Γáç", "ΓáÅ"]
+SPINNER_FRAME = 0
+
+def status(msg: str, color: str = CYAN):
+    global SPINNER_FRAME
+    frame = SPINNER_FRAMES[SPINNER_FRAME % len(SPINNER_FRAMES)]
+    SPINNER_FRAME += 1
+    print(f"\r{color}{frame} {msg}{RESET}", end="", flush=True)
+
+def clear_status():
+    print("\r" + " " * 60 + "\r", end="", flush=True)
+
+def print_status(msg: str, color: str = CYAN):
+    clear_status()
+    print(f"{color}Γ₧£ {msg}{RESET}")
+
+def print_phase(msg: str):
+    print(f"\n{BOLD}{CYAN}Γû╕ {msg}{RESET}")
+
+def print_done(count: int, label: str = "findings"):
+    print(f"{GREEN}Γ£ô {count} {label}{RESET}")
 
 # ΓöÇΓöÇ Runtime globals (populated from CLI before scan starts) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 _AUTH_HEADERS: dict[str, str] = {}
@@ -3390,7 +3434,7 @@ async def run_scan(target: str, checks: list[str], spider_depth: int,
                    verbose: bool, webhook_url: str = "", db_path: str = "",
                    content_wordlist: Optional[list[str]] = None,
                    screenshot_dir: str = "") -> ScanResult:
-    result = ScanResult(target=target, started_at=datetime.utcnow().isoformat())
+    result = ScanResult(target=target, started_at=datetime.now(timezone.utc).isoformat())
 
     connector = aiohttp.TCPConnector(ssl=False, limit=30)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -3398,62 +3442,68 @@ async def run_scan(target: str, checks: list[str], spider_depth: int,
 
         # Spider runs first so crawled URLs are available for other checks
         if "spider" in selected:
+            print_phase("Crawling target")
             await check_spider_and_forms(session, target, result,
                                           spider_depth, spider_pages, verbose)
 
         check_map = {
-            "headers":        lambda: check_security_headers(session, target, result),
-            "files":          lambda: check_sensitive_files(session, target, result),
-            "methods":        lambda: check_http_methods(session, target, result),
-            "ssl":            lambda: check_ssl_redirect(session, target, result),
-            "xss":            lambda: check_xss(session, target, result),
-            "sqli":           lambda: check_sqli(session, target, result),
-            "redirect":       lambda: check_open_redirect(session, target, result),
-            "cors":           lambda: check_cors(session, target, result),
-            "clickjack":      lambda: check_clickjacking(session, target, result),
-            "dirlist":        lambda: check_directory_listing(session, target, result),
-            "cookies":        lambda: check_cookie_flags(session, target, result),
-            "traversal":      lambda: check_path_traversal(session, target, result),
-            "ssrf":           lambda: check_ssrf(session, target, result),
-            "cmdi":           lambda: check_command_injection(session, target, result),
-            "xxe":            lambda: check_xxe(session, target, result),
-            "jwt":            lambda: check_jwt(session, target, result),
-            "secrets":        lambda: check_sensitive_data_exposure(session, target, result),
-            "jslibs":         lambda: check_js_libraries(session, target, result),
-            "defaultcreds":   lambda: check_default_credentials(session, target, result),
-            "ratelimit":      lambda: check_rate_limiting(session, target, result),
-            "ssti":           lambda: check_ssti(session, target, result),
-            "crlf":           lambda: check_crlf(session, target, result),
-            "hostheader":     lambda: check_host_header_injection(session, target, result),
-            "idor":           lambda: check_idor(session, target, result),
-            "graphql":        lambda: check_graphql(session, target, result),
-            "techfingerprint":lambda: check_tech_fingerprint(session, target, result),
-            "waf":            lambda: check_waf(session, target, result),
-            "jsendpoints":    lambda: check_js_endpoints(session, target, result),
-            "zonetransfer":   lambda: check_zone_transfer(session, target, result),
-            "certtransparency":lambda: check_cert_transparency(session, target, result),
-            "fileupload":      lambda: check_file_upload(session, target, result),
-            "protopollution":  lambda: check_prototype_pollution(session, target, result),
-            "smuggling":       lambda: check_request_smuggling(session, target, result),
-            "parampollution":  lambda: check_param_pollution(session, target, result),
-            "deserial":        lambda: check_insecure_deserialization(session, target, result),
-            "content":         lambda: check_content_discovery(session, target, result,
-                                                               content_wordlist),
-            "websockets":      lambda: check_websockets(session, target, result),
-            "apifuzz":         lambda: check_api_fuzzing(session, target, result),
-            "tls":             lambda: check_tls(session, target, result),
-            "depcve":          lambda: check_dependency_cves(session, target, result),
-            "oauth":           lambda: check_oauth(session, target, result),
-            "subdomains":      lambda: check_subdomains(session, target, result,
-                                                        subdomain_wordlist, verbose),
+            "headers":        ("Security headers", lambda: check_security_headers(session, target, result)),
+            "files":          ("Sensitive files", lambda: check_sensitive_files(session, target, result)),
+            "methods":       ("HTTP methods", lambda: check_http_methods(session, target, result)),
+            "ssl":          ("SSL redirect", lambda: check_ssl_redirect(session, target, result)),
+            "xss":          ("XSS", lambda: check_xss(session, target, result)),
+            "sqli":         ("SQL injection", lambda: check_sqli(session, target, result)),
+            "redirect":      ("Open redirects", lambda: check_open_redirect(session, target, result)),
+            "cors":         ("CORS", lambda: check_cors(session, target, result)),
+            "clickjack":    ("Clickjacking", lambda: check_clickjacking(session, target, result)),
+            "dirlist":      ("Directory listing", lambda: check_directory_listing(session, target, result)),
+            "cookies":      ("Cookies", lambda: check_cookie_flags(session, target, result)),
+            "traversal":    ("Path traversal", lambda: check_path_traversal(session, target, result)),
+            "ssrf":        ("SSRF", lambda: check_ssrf(session, target, result)),
+            "cmdi":        ("Command injection", lambda: check_command_injection(session, target, result)),
+            "xxe":         ("XXE", lambda: check_xxe(session, target, result)),
+            "jwt":         ("JWT", lambda: check_jwt(session, target, result)),
+            "secrets":     ("Sensitive data", lambda: check_sensitive_data_exposure(session, target, result)),
+            "jslibs":      ("JS libraries", lambda: check_js_libraries(session, target, result)),
+            "defaultcreds":("Default creds", lambda: check_default_credentials(session, target, result)),
+            "ratelimit":   ("Rate limiting", lambda: check_rate_limiting(session, target, result)),
+            "ssti":        ("SSTI", lambda: check_ssti(session, target, result)),
+            "crlf":        ("CRLF injection", lambda: check_crlf(session, target, result)),
+            "hostheader": ("Host header", lambda: check_host_header_injection(session, target, result)),
+            "idor":        ("IDOR", lambda: check_idor(session, target, result)),
+            "graphql":     ("GraphQL", lambda: check_graphql(session, target, result)),
+            "techfingerprint":("Tech fingerprint", lambda: check_tech_fingerprint(session, target, result)),
+            "waf":         ("WAF", lambda: check_waf(session, target, result)),
+            "jsendpoints": ("JS endpoints", lambda: check_js_endpoints(session, target, result)),
+            "zonetransfer":("Zone transfer", lambda: check_zone_transfer(session, target, result)),
+            "certtransparency":("Cert transparency", lambda: check_cert_transparency(session, target, result)),
+            "fileupload":   ("File upload", lambda: check_file_upload(session, target, result)),
+            "protopollution":("Prototype pollution", lambda: check_prototype_pollution(session, target, result)),
+            "smuggling":   ("Request smuggling", lambda: check_request_smuggling(session, target, result)),
+            "parampollution":("Param pollution", lambda: check_param_pollution(session, target, result)),
+            "deserial":    ("Deserialization", lambda: check_insecure_deserialization(session, target, result)),
+            "content":    ("Content discovery", lambda: check_content_discovery(session, target, result, content_wordlist)),
+            "websockets":  ("WebSockets", lambda: check_websockets(session, target, result)),
+            "apifuzz":    ("API fuzzing", lambda: check_api_fuzzing(session, target, result)),
+            "tls":        ("TLS", lambda: check_tls(session, target, result)),
+            "depcve":     ("Dependency CVEs", lambda: check_dependency_cves(session, target, result)),
+            "oauth":      ("OAuth", lambda: check_oauth(session, target, result)),
+            "subdomains": ("Subdomains", lambda: check_subdomains(session, target, result, subdomain_wordlist, verbose)),
         }
 
-        tasks = [check_map[c]() for c in selected if c in check_map and c != "spider"]
+        for check_name in selected:
+            if check_name == "spider":
+                continue
+            if check_name in check_map:
+                label, _ = check_map[check_name]
+                print_phase(f"Checking {label}")
+
+        tasks = [check_map[c][1]() for c in selected if c in check_map and c != "spider"]
         if _LOADED_PLUGINS:
             tasks.append(run_plugins(session, target, result))
         await asyncio.gather(*tasks)
 
-    result.finished_at = datetime.utcnow().isoformat()
+    result.finished_at = datetime.now(timezone.utc).isoformat()
 
     if screenshot_dir:
         all_urls = [target] + result.crawled_urls[:19]
