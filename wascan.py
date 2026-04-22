@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 wascan ΓÇö Web Application Vulnerability Scanner
-Usage: python3 scanner.py <target_url> [options]
+Usage: python3 wascan.py <target_url> [options]
 """
 
 import asyncio
@@ -3566,17 +3566,17 @@ def main():
             "  --diff-scans ID1:ID2         Diff two scan IDs (new/fixed/unchanged)\n"
             "  --mark-fp FINDING_ID         Mark a finding as a false positive\n\n"
             "Examples:\n"
-            "  python3 scanner.py https://example.com --profile quick\n"
-            "  python3 scanner.py https://example.com --profile stealth --delay 2.0\n"
-            "  python3 scanner.py https://example.com --proxy http://127.0.0.1:8080\n"
-            "  python3 scanner.py https://example.com --login-url https://example.com/login "
+            "  python3 wascan.py https://example.com --profile quick\n"
+            "  python3 wascan.py https://example.com --profile stealth --delay 2.0\n"
+            "  python3 wascan.py https://example.com --proxy http://127.0.0.1:8080\n"
+            "  python3 wascan.py https://example.com --login-url https://example.com/login "
             "--login-data 'user=admin&pass=x' --login-success 'Dashboard'\n"
-            "  python3 scanner.py https://example.com --checks content --content-wordlist words.txt\n"
-            "  python3 scanner.py https://example.com --output html --report-file out.html\n"
-            "  python3 scanner.py https://example.com --fail-on high\n"
-            "  python3 scanner.py --db scans.db --list-scans\n"
-            "  python3 scanner.py --db scans.db --diff-scans 1:2\n"
-            "  python3 scanner.py --db scans.db --mark-fp 42\n"
+            "  python3 wascan.py https://example.com --checks content --content-wordlist words.txt\n"
+            "  python3 wascan.py https://example.com --output html --report-file out.html\n"
+            "  python3 wascan.py https://example.com --fail-on high\n"
+            "  python3 wascan.py --db scans.db --list-scans\n"
+            "  python3 wascan.py --db scans.db --diff-scans 1:2\n"
+            "  python3 wascan.py --db scans.db --mark-fp 42\n"
         ),
     )
     parser.add_argument("target", nargs="?", default=None,
