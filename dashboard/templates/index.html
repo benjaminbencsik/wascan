@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>wascan Dashboard</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f7fa; color: #333; line-height: 1.6; }
+        .header { background: #1a1a2e; color: #fff; padding: 20px 30px; display: flex; justify-content: space-between; align-items: center; }
+        .header h1 { color: #e94560; font-size: 1.5em; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .card { background: #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 20px; overflow: hidden; }
+        .card-header { padding: 15px 20px; background: #f8f9fa; border-bottom: 1px solid #eee; font-weight: 600; }
+        .card-body { padding: 20px; }
+        .form-group { margin-bottom: 15px; }
+        .form-group label { display: block; margin-bottom: 5px; font-weight: 500; }
+        .form-group input, .form-group select { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
+        .btn { background: #e94560; color: #fff; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-size: 14px; }
+        .btn:hover { background: #d63651; }
+        .btn-secondary { background: #6c757d; }
+        .btn-secondary:hover { background: #5a6268; }
+        .stats { display: flex; gap: 15px; flex-wrap: wrap; margin-bottom: 20px; }
+        .stat { background: #fff; border-radius: 8px; padding: 20px; flex: 1; min-width: 120px; text-align: center; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        .stat-value { font-size: 2em; font-weight: bold; }
+        .stat-label { color: #666; font-size: 0.9em; }
+        .critical { color: #e74c3c; }
+        .high { color: #e67e22; }
+        .medium { color: #f39c12; }
+        .low { color: #3498db; }
+        .info { color: #95a5a6; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #eee; }
+        th { background: #f8f9fa; font-weight: 600; }
+        tr:hover { background: #fafafa; }
+        .badge { display: inline-block; padding: 3px 8px; border-radius: 3px; font-size: 0.8em; font-weight: 600; color: #fff; }
+        .badge-critical { background: #e74c3c; }
+        .badge-high { background: #e67e22; }
+        .badge-medium { background: #f39c12; }
+        .badge-low { background: #3498db; }
+        .badge-info { background: #95a5a6; }
+        .loading { text-align: center; padding: 40px; color: #666; }
+        .spinner { border: 3px solid #f3f3f3; border-top: 3px solid #e94560; border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; margin: 0 auto 10px; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .empty { text-align: center; padding: 40px; color: #999; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>wascan</h1>
+        <span>Web Application Vulnerability Scanner</span>
+    </div>
+
+    <div class="container">
+        <div class="card">
+            <div class="card-header">New Scan</div>
+            <div class="card-body">
+                <form id="scanForm">
+                    <div class="form-group">
+                        <label>Target URL</label>
+                        <input type="text" id="target" placeholder="https://example.com" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Profile</label>
+                        <select id="profile">
+                            <option value="quick">Quick (fast checks)</option>
+                            <option value="stealth">Stealth (quiet, slower)</option>
+                            <option value="full" selected>Full (all checks)</option>
+                        </select>
+                    </div>
+                    <button type="submit" class="btn">Start Scan</button>
+                </form>
+            </div>
+        </div>
+
+        <div class="stats" id="stats">
+            <div class="stat">
+                <div class="stat-value" id="totalScans">0</div>
+                <div class="stat-label">Total Scans</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value critical" id="criticalCount">0</div>
+                <div class="stat-label">Critical</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value high" id="highCount">0</div>
+                <div class="stat-label">High</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value medium" id="mediumCount">0</div>
+                <div class="stat-label">Medium</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">Recent Scans</div>
+            <div class="card-body">
+                <table id="scansTable">
+                    <thead>
+                        <tr>
+                            <th>Target</th>
+                            <th>Status</th>
+                            <th>Started</th>
+                            <th>Findings</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="scansList">
+                        <tr><td colspan="5" class="empty">No scans yet</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = '';
+
+        async function loadScans() {
+            try {
+                const resp = await fetch(`${API_BASE}/scans`);
+                const scans = await resp.json();
+                updateStats(scans);
+                renderScans(scans);
+            } catch (e) {
+                console.error('Failed to load scans:', e);
+            }
+        }
+
+        function updateStats(scans) {
+            document.getElementById('totalScans').textContent = scans.length;
+            let critical = 0, high = 0, medium = 0;
+            scans.forEach(s => {
+                if (s.status === 'completed') {
+                    critical += (s.findings_count || 0);
+                    high += (s.findings_count || 0);
+                    medium += (s.findings_count || 0);
+                }
+            });
+            document.getElementById('criticalCount').textContent = critical;
+            document.getElementById('highCount').textContent = high;
+            document.getElementById('mediumCount').textContent = medium;
+        }
+
+        function renderScans(scans) {
+            const tbody = document.getElementById('scansList');
+            if (!scans.length) {
+                tbody.innerHTML = '<tr><td colspan="5" class="empty">No scans yet</td></tr>';
+                return;
+            }
+            tbody.innerHTML = scans.map(s => `
+                <tr>
+                    <td>${s.target}</td>
+                    <td><span class="badge badge-${s.status === 'completed' ? 'high' : s.status === 'running' ? 'medium' : 'info'}">${s.status}</span></td>
+                    <td>${new Date(s.started_at).toLocaleString()}</td>
+                    <td>${s.findings_count || 0}</td>
+                    <td>
+                        <button class="btn btn-secondary" onclick="viewScan('${s.id}')">View</button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        async function viewScan(id) {
+            const resp = await fetch(`${API_BASE}/scans/${id}`);
+            const scan = await resp.json();
+            let findingsHtml = '';
+            if (scan.findings && scan.findings.length) {
+                findingsHtml = scan.findings.map(f => `
+                    <tr style="border-left: 4px solid ${getSeverityColor(f.severity)}">
+                        <td><span class="badge badge-${f.severity}">${f.severity}</span></td>
+                        <td>${f.title}</td>
+                        <td>${f.url}</td>
+                        <td>${f.description}</td>
+                    </tr>
+                `).join('');
+            } else {
+                findingsHtml = '<tr><td colspan="4" class="empty">No findings</td></tr>';
+            }
+            alert(`Scan Results for ${scan.target}\n\nFindings: ${scan.findings.length}\nCrawled URLs: ${scan.crawled_urls.length}\nSubdomains: ${scan.discovered_subdomains.length}`);
+        }
+
+        function getSeverityColor(severity) {
+            const colors = { critical: '#e74c3c', high: '#e67e22', medium: '#f39c12', low: '#3498db', info: '#95a5a6' };
+            return colors[severity] || '#999';
+        }
+
+        document.getElementById('scanForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const target = document.getElementById('target').value;
+            const profile = document.getElementById('profile').value;
+
+            try {
+                const resp = await fetch(`${API_BASE}/scans`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ target, profile })
+                });
+                if (resp.ok) {
+                    document.getElementById('target').value = '';
+                    loadScans();
+                }
+            } catch (err) {
+                alert('Failed to start scan: ' + err.message);
+            }
+        });
+
+        loadScans();
+        setInterval(loadScans, 5000);
+    </script>
+</body>
+</html>
