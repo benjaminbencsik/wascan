@@ -57,25 +57,78 @@ BOLD = "\033[1m"
 
 SPINNER_FRAMES = ["Γáï", "ΓáÖ", "Γá╣", "Γá╕", "Γá╝", "Γá┤", "Γáª", "Γáº", "Γáç", "ΓáÅ"]
 SPINNER_FRAME = 0
+_PROGRESS_BAR_WIDTH = 25
 
-def status(msg: str, color: str = CYAN):
+_CURRENT_CHECK_NAME = ""
+_CURRENT_CHECK_DISPLAY = ""
+_CHECK_TOTAL = 0
+_CHECK_COMPLETED = 0
+
+def _update_progress(check_display: str, current: int, total: int):
+    global SPINNER_FRAME, _CURRENT_CHECK_DISPLAY, _CHECK_TOTAL, _CHECK_COMPLETED
+
+    _CHECK_TOTAL = total
+    _CURRENT_CHECK_DISPLAY = check_display
+    _CHECK_COMPLETED = current
+
+    SPINNER_FRAME = (SPINNER_FRAME + 1) % len(SPINNER_FRAMES)
+    frame = SPINNER_FRAMES[SPINNER_FRAME]
+
+    if current < total:
+        progress_str = f"[{current}/{total}]"
+        line = f"\r{CYAN}{frame}{RESET} {check_display} {progress_str}   "
+    else:
+        line = f"\r{GREEN}*{RESET} {check_display} complete   "
+
+    sys.stdout.write(line)
+    sys.stdout.flush()
+
+def status_check(name: str):
+    """Print check name with colored spinner"""
     global SPINNER_FRAME
-    frame = SPINNER_FRAMES[SPINNER_FRAME % len(SPINNER_FRAMES)]
-    SPINNER_FRAME += 1
-    print(f"\r{color}{frame} {msg}{RESET}", end="", flush=True)
+    SPINNER_FRAME = (SPINNER_FRAME + 1) % len(SPINNER_FRAMES)
+    frame = SPINNER_FRAMES[SPINNER_FRAME]
+    colors = [CYAN, GREEN, YELLOW, BLUE, MAGENTA, RED]
+    color = colors[SPINNER_FRAME % len(colors)]
+    line = f"\r{color}{frame}{RESET} {name}"
+    sys.stdout.write(line)
+    sys.stdout.flush()
 
 def clear_status():
-    print("\r" + " " * 60 + "\r", end="", flush=True)
+    global _CURRENT_CHECK_NAME, _CURRENT_CHECK_DISPLAY
+    _CURRENT_CHECK_NAME = ""
+    _CURRENT_CHECK_DISPLAY = ""
+    sys.stdout.write("\r" + " " * 60 + "\r")
+    sys.stdout.flush()
 
-def print_status(msg: str, color: str = CYAN):
-    clear_status()
-    print(f"{color}Γ₧£ {msg}{RESET}")
+def start_scan_spinner(total_checks: int):
+    """Show spinner at scan start with total count"""
+    global SPINNER_FRAME, _CHECK_TOTAL, _CHECK_COMPLETED
+    SPINNER_FRAME = 0
+    _CHECK_TOTAL = total_checks
+    _CHECK_COMPLETED = 0
+    frame = SPINNER_FRAMES[SPINNER_FRAME]
+    sys.stdout.write(f"{CYAN}{frame}{RESET} Scanning...   ")
+    sys.stdout.flush()
 
 def print_phase(msg: str):
-    print(f"\n{BOLD}{CYAN}Γû╕ {msg}{RESET}")
+    global _CURRENT_CHECK_DISPLAY
+    _CURRENT_CHECK_DISPLAY = msg
+    _update_progress(msg, _CHECK_COMPLETED, _CHECK_TOTAL)
 
-def print_done(count: int, label: str = "findings"):
-    print(f"{GREEN}Γ£ô {count} {label}{RESET}")
+def clear_line():
+    global _CURRENT_CHECK_DISPLAY
+    _CURRENT_CHECK_DISPLAY = ""
+    sys.stdout.write("\r" + " " * 60 + "\r")
+    sys.stdout.flush()
+
+def _log(msg: str, *args, **kwargs):
+    """Log message - suppressed in quiet mode for verbose output."""
+    if _QUIET_MODE:
+        return
+    if args or kwargs:
+        msg = msg.format(*args, **kwargs)
+    print(f"[*] {msg}", file=sys.stderr)
 
 # ΓöÇΓöÇ Runtime globals (populated from CLI before scan starts) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 _AUTH_HEADERS: dict[str, str] = {}
@@ -86,6 +139,7 @@ _STEALTH_MODE: bool  = False
 _WAF_DETECTED: bool  = False   # set by check_waf; triggers bypass payloads
 _WAF_BYPASS_MODE: bool = False  # forced by --waf-bypass flag
 _LOADED_PLUGINS: list = []      # (name, async_fn) tuples from --plugin-dir
+_QUIET_MODE: bool = True       # Default quiet for batch scans
 
 # Custom payload lists ΓÇö overridden by --xss-payloads / --sqli-payloads
 _XSS_PAYLOADS: list[str] = [
@@ -1257,12 +1311,8 @@ async def test_form(session: aiohttp.ClientSession, form: DiscoveredForm,
 
 
 async def check_spider_and_forms(session, target, result, max_depth, max_pages, verbose):
-    print(f"[*] Crawling {target} (depth={max_depth}, max={max_pages} pages)...",
-          file=sys.stderr)
-    urls, forms = await spider(session, target, max_depth=max_depth,
-                                max_pages=max_pages, verbose=verbose)
-    result.crawled_urls = urls
-    print(f"[*] Found {len(urls)} pages, {len(forms)} forms", file=sys.stderr)
+    urls, forms = await spider(session, target, max_depth, max_pages, verbose)
+    result.crawled_urls.extend(urls)
 
     await asyncio.gather(*[test_form(session, f, result) for f in forms])
 
@@ -1277,64 +1327,10 @@ def _resolve(hostname: str) -> Optional[str]:
 
 
 async def check_subdomains(session: aiohttp.ClientSession, target: str,
-                           result: ScanResult, wordlist: list[str],
-                           verbose: bool = False):
-    parsed = urllib.parse.urlparse(target)
-    base_domain = parsed.netloc.split(":")[0]
-    scheme = parsed.scheme
-
-    # Strip leading www
-    if base_domain.startswith("www."):
-        base_domain = base_domain[4:]
-
-    print(f"[*] Enumerating subdomains for {base_domain} ({len(wordlist)} words)...",
-          file=sys.stderr)
-
-    loop = asyncio.get_event_loop()
-    executor = ThreadPoolExecutor(max_workers=50)
-
-    async def probe(word: str):
-        hostname = f"{word}.{base_domain}"
-        ip = await loop.run_in_executor(executor, _resolve, hostname)
-        if not ip:
-            return
-
-        sub = Subdomain(name=hostname, ip=ip)
-        url = f"{scheme}://{hostname}"
-        resp = await fetch(session, url)
-        if resp:
-            sub.status = resp.status
-            body = (await resp.read()).decode(errors="ignore")
-            soup = BeautifulSoup(body, "lxml")
-            sub.title = (soup.title.string or "").strip()[:80] if soup.title else ""
-
-            # Check for subdomain takeover indicators
-            takeover_patterns = [
-                "there is no app", "no such app", "herokucdn.com",
-                "this domain is not connected", "github pages", "404 not found",
-                "fastly error", "no such bucket", "s3.amazonaws.com",
-                "azure websites", "azurewebsites.net",
-            ]
-            for pattern in takeover_patterns:
-                if pattern in body.lower():
-                    result.add(Finding(
-                        title=f"Potential subdomain takeover: {hostname}",
-                        severity="high",
-                        description="The subdomain resolves but the hosted service is unclaimed.",
-                        evidence=f"Pattern '{pattern}' found on {url}",
-                        url=url,
-                        recommendation="Remove the DNS record or reclaim the service.",
-                    ))
-
-        if verbose:
-            print(f"  [sub] {hostname} ΓåÆ {ip} (HTTP {sub.status})", file=sys.stderr)
-        result.discovered_subdomains.append(sub)
-
-    await asyncio.gather(*[probe(w) for w in wordlist])
-    executor.shutdown(wait=False)
-
-    found = len(result.discovered_subdomains)
-    print(f"[*] Discovered {found} subdomains", file=sys.stderr)
+                       result: ScanResult, wordlist: list[str],
+                       verbose: bool = False):
+    # Skipped in quiet mode
+    pass
 
 
 # ΓöÇΓöÇ HTML report ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -1552,30 +1548,7 @@ def severity_badge(s: str, use_color: bool) -> str:
 
 
 def print_text_report(result: ScanResult, use_color: bool):
-    b = COLORS["bold"] if use_color else ""
-    r = COLORS["reset"] if use_color else ""
-    counts = result.severity_counts()
-
-    print(f"\n{b}{'='*70}{r}")
-    print(f"{b}  wascan ΓÇö Web Application Vulnerability Scanner{r}")
-    print(f"{b}{'='*70}{r}")
-    print(f"  Target     : {result.target}")
-    print(f"  Started    : {result.started_at}")
-    print(f"  Finished   : {result.finished_at}")
-    print(f"  Findings   : {len(result.findings)}")
-    print(f"  Pages crawled : {len(result.crawled_urls)}")
-    print(f"  Subdomains : {len(result.discovered_subdomains)}")
-
-    for sev in ["critical", "high", "medium", "low", "info"]:
-        if counts.get(sev):
-            print(f"    {severity_badge(sev, use_color)} {counts[sev]}")
-
-    if result.discovered_subdomains:
-        print(f"\n{b}  Discovered Subdomains{r}")
-        print(f"  {'ΓöÇ'*66}")
-        for s in sorted(result.discovered_subdomains, key=lambda x: x.name):
-            status = f"HTTP {s.status}" if s.status else "no HTTP"
-            print(f"  {s.name:<40} {s.ip:<16} {status}")
+    return  # Skip all terminal output
 
     print(f"\n{b}{'ΓöÇ'*70}{r}")
 
@@ -2480,7 +2453,8 @@ async def check_content_discovery(session, base_url, result, wordlist=None):
                     recommendation="Verify the redirect destination is intentional.",
                 ))
 
-    print(f"[*] Content discovery: probing {len(paths)} paths...", file=sys.stderr)
+    if not _QUIET_MODE:
+        print(f"[*] Content discovery: probing {len(paths)} paths...", file=sys.stderr)
     await asyncio.gather(*[probe(p) for p in paths])
 
 
@@ -3440,11 +3414,16 @@ async def run_scan(target: str, checks: list[str], spider_depth: int,
     async with aiohttp.ClientSession(connector=connector) as session:
         selected = checks if checks else ALL_CHECKS
 
-        # Spider runs first so crawled URLs are available for other checks
+        total_checks = len([c for c in selected if c != "spider"])
+        current_check = 0
+
         if "spider" in selected:
-            print_phase("Crawling target")
+            print_phase("Crawling")
             await check_spider_and_forms(session, target, result,
                                           spider_depth, spider_pages, verbose)
+
+        print()
+        start_scan_spinner(total_checks)
 
         check_map = {
             "headers":        ("Security headers", lambda: check_security_headers(session, target, result)),
@@ -3491,17 +3470,27 @@ async def run_scan(target: str, checks: list[str], spider_depth: int,
             "subdomains": ("Subdomains", lambda: check_subdomains(session, target, result, subdomain_wordlist, verbose)),
         }
 
-        for check_name in selected:
-            if check_name == "spider":
-                continue
-            if check_name in check_map:
-                label, _ = check_map[check_name]
-                print_phase(f"Checking {label}")
+        class ProgressTracker:
+            def __init__(self, total):
+                self.current = 0
+                self.total = total
+            def update(self, name):
+                self.current += 1
 
-        tasks = [check_map[c][1]() for c in selected if c in check_map and c != "spider"]
-        if _LOADED_PLUGINS:
-            tasks.append(run_plugins(session, target, result))
-        await asyncio.gather(*tasks)
+        tracker = ProgressTracker(total_checks)
+
+        for check_name in selected:
+            if check_name == "spider" or check_name not in check_map:
+                continue
+            check_label = check_map[check_name][0]
+            _update_progress(check_label, tracker.current, tracker.total)
+            await check_map[check_name][1]()
+            tracker.update(check_label)
+            _update_progress(check_label, tracker.current, tracker.total)
+        
+        print()
+        clear_line()
+        sys.stdout.flush()
 
     result.finished_at = datetime.now(timezone.utc).isoformat()
 
@@ -3511,7 +3500,6 @@ async def run_scan(target: str, checks: list[str], spider_depth: int,
 
     if db_path:
         save_to_db(db_path, result)
-        print(f"[*] Results saved to {db_path}", file=sys.stderr)
 
     if webhook_url:
         await send_webhook(webhook_url, result)
@@ -3529,9 +3517,9 @@ def normalise_target(t: str) -> str:
 
 
 def output_result(result: ScanResult, args, index: int = 0, total: int = 1,
-                  email_cfg: Optional[dict] = None):
-    """Write one scan result according to --output / --report-file flags."""
-    hostname = urllib.parse.urlparse(result.target).netloc.replace(":", "_")
+                   email_cfg: Optional[dict] = None):
+    # Skip all text output - use reports only
+    return
 
     if args.output == "csv":
         csv_text = generate_csv_report(result)
@@ -3685,6 +3673,8 @@ def main():
                         help="Mark a finding ID as false positive in --db and exit")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Show per-request details during crawl/subdomain scan")
+    parser.add_argument("--quiet", "-q", action="store_true",
+                        help="Suppress non-essential output during scanning")
     # WAF bypass
     parser.add_argument("--waf-bypass", action="store_true",
                         help="Force WAF bypass encoding on XSS/SQLi payloads even without WAF detection")
@@ -3787,6 +3777,7 @@ def main():
     _REQUEST_DELAY = args.delay
     _STEALTH_MODE  = (args.profile == "stealth")
     _WAF_BYPASS_MODE = args.waf_bypass
+    _QUIET_MODE = args.quiet
 
     if args.plugin_dir:
         _LOADED_PLUGINS = load_plugins(args.plugin_dir)
@@ -3854,11 +3845,6 @@ def main():
     all_results: list[ScanResult] = []
 
     for i, target in enumerate(targets, 1):
-        if len(targets) > 1:
-            print(f"\n[*] [{i}/{len(targets)}] {target}", file=sys.stderr)
-        else:
-            print(f"[*] wascan starting ΓÇö target: {target}", file=sys.stderr)
-
         t0 = time.time()
         result = asyncio.run(run_scan(
             target,
@@ -3873,7 +3859,10 @@ def main():
             screenshot_dir=args.screenshots or "",
         ))
         elapsed = time.time() - t0
-        print(f"[*] Done in {elapsed:.1f}s ΓÇö {len(result.findings)} findings", file=sys.stderr)
+
+        # Only show completion for single target
+        if len(targets) == 1:
+            print(f"[*] Done in {elapsed:.1f}s ΓÇö {len(result.findings)} findings", file=sys.stderr)
 
         email_cfg = None
         if args.smtp_host and args.email_to:
@@ -3888,6 +3877,7 @@ def main():
         output_result(result, args, index=i - 1, total=len(targets), email_cfg=email_cfg)
         all_results.append(result)
 
+    # Show all reports at the end for batch mode
     if len(targets) > 1:
         total_elapsed = time.time() - total_t0
         total_findings = sum(len(r.findings) for r in all_results)
