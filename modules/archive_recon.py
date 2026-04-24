@@ -6,6 +6,7 @@ import re
 
 logger = logging.getLogger("wascan")
 
+# Native Python equivalents of popular gf patterns for categorization
 GF_PATTERNS = {
     "xss": re.compile(r'(?i)[?&](q|s|search|lang|keyword|query|page|q1|view|id|name)='),
     "sqli": re.compile(r'(?i)[?&](id|select|report|role|update|query|user|name|sort|where|search|params|dir|row|table|from|sel|results|sleep|fetch|order|limit|column|group|cat)='),
@@ -20,21 +21,20 @@ async def run_check(session, target_url, config, semaphore, result):
     if domain.startswith("www."):
         domain = domain[4:]
 
-    # 1. Gather the main domain PLUS all discovered subdomains
+    # Combine main domain and all found subdomains as targets for gau
     targets = {domain}
     if result.discovered_subdomains:
         for sub in result.discovered_subdomains:
             targets.add(sub.name)
             
-    # Convert the set of targets into a newline-separated string
     target_list_str = "\n".join(targets)
 
     logger.info(f"Phase: Fetching historical URLs for {len(targets)} domains/subdomains via gau...")
     
     try:
-        # 2. Feed the target list directly into gau via standard input
+        # Run gau using the absolute path found on your system
         proc = await asyncio.create_subprocess_shell(
-            "gau --threads 10 2>/dev/null",
+            "/home/admin/go/bin/gau --threads 10 2>/dev/null",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
@@ -78,6 +78,7 @@ async def run_check(session, target_url, config, semaphore, result):
                     for u in urls: f.write(u + "\n")
                 logger.info(f"Categorized {len(urls)} URLs into gf_{pattern_name}.txt")
         
+    # Feed historical URLs into the engine's crawl list for active scanning
     for u in useful_urls:
         if u not in result.crawled_urls:
             result.crawled_urls.append(u)
