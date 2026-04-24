@@ -6,7 +6,6 @@ import re
 
 logger = logging.getLogger("wascan")
 
-# Native Python equivalents of common gf patterns for categorizing historical data
 GF_PATTERNS = {
     "xss": re.compile(r'(?i)[?&](q|s|search|lang|keyword|query|page|q1|view|id|name)='),
     "sqli": re.compile(r'(?i)[?&](id|select|report|role|update|query|user|name|sort|where|search|params|dir|row|table|from|sel|results|sleep|fetch|order|limit|column|group|cat)='),
@@ -21,32 +20,33 @@ async def run_check(session, target_url, config, semaphore, result):
     if domain.startswith("www."):
         domain = domain[4:]
 
-    # Include discovered subdomains in the targets for gau
+    # Feed the root domain PLUS all live subdomains to gau
     targets = {domain}
-    if result.discovered_subdomains:
-        for sub in result.discovered_subdomains:
-            targets.add(sub.name)
+    for sub in result.discovered_subdomains:
+        targets.add(sub.name)
             
     target_list_str = "\n".join(targets)
 
     logger.info(f"Phase: Fetching historical URLs for {len(targets)} domains/subdomains via gau...")
     
     try:
-        # Run gau using the verified global path and piping the target list via stdin
         proc = await asyncio.create_subprocess_shell(
-            "/usr/local/bin/gau --threads 10 2>/dev/null",
+            "/usr/local/bin/gau --threads 10",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, _ = await proc.communicate(input=target_list_str.encode())
+        stdout, stderr = await proc.communicate(input=target_list_str.encode())
+        
+        if stderr: logger.debug(f"gau error: {stderr.decode()}")
+        
         historical_urls = set(line.strip().decode('utf-8') for line in stdout.splitlines() if line.strip())
     except Exception as e:
-        logger.debug(f"Failed to run gau: {e}")
+        logger.error(f"Failed to run gau: {e}")
         historical_urls = set()
 
     if not historical_urls:
-        logger.warning("No historical URLs found. Ensure 'gau' is installed and in your PATH.")
+        logger.warning("No historical URLs found via gau.")
         return
 
     useful_urls = set()
@@ -75,8 +75,7 @@ async def run_check(session, target_url, config, semaphore, result):
             if urls:
                 file_path = os.path.join(config.output_dir, f"gf_{pattern_name}.txt")
                 with open(file_path, "w") as f:
-                    for u in urls:
-                        f.write(u + "\n")
+                    for u in urls: f.write(u + "\n")
                 logger.info(f"Categorized {len(urls)} URLs into gf_{pattern_name}.txt")
         
     for u in useful_urls:
