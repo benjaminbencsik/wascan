@@ -57,16 +57,16 @@ async def run_check(session, target_url, config, semaphore, result):
         for sub in subdomains:
             f.write(sub + "\n")
 
-    # 3. Probe with httpx using the absolute path found on your system
+    # 3. Probe with httpx using the verified global path
     try:
         proc3 = await asyncio.create_subprocess_shell(
-            f"/home/admin/.local/bin/httpx -l {temp_file} -silent -title -status-code -no-color 2>/dev/null",
+            f"/usr/local/bin/httpx -l {temp_file} -silent -title -status-code -no-color 2>/dev/null",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         stdout3, _ = await proc3.communicate()
         
-        # Dynamically retrieve the Subdomain dataclass from the main engine
+        # Retrieve the Subdomain dataclass from memory to avoid circular imports
         Subdomain = getattr(sys.modules.get('__main__'), 'Subdomain', None)
         
         for line in stdout3.splitlines():
