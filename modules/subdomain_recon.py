@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 import urllib.parse
 import sys
 
@@ -19,26 +18,27 @@ async def run_check(session, target_url, config, semaphore, result):
     # 1. Fetch subdomains using subfinder
     try:
         proc = await asyncio.create_subprocess_shell(
-            f"subfinder -d {domain} -silent 2>/dev/null",
+            f"subfinder -d {domain} -silent",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, _ = await proc.communicate()
+        stdout, stderr = await proc.communicate()
+        if stderr: logger.debug(f"Subfinder error: {stderr.decode()}")
         for line in stdout.splitlines():
             sub = line.strip().decode('utf-8').lower()
             if sub.endswith(domain):
                 subdomains.add(sub)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Subfinder execution failed: {e}")
 
     # 2. Fetch subdomains using assetfinder
     try:
         proc2 = await asyncio.create_subprocess_shell(
-            f"assetfinder --subs-only {domain} 2>/dev/null",
+            f"assetfinder --subs-only {domain}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout2, _ = await proc2.communicate()
+        stdout2, stderr2 = await proc2.communicate()
         for line in stdout2.splitlines():
             sub = line.strip().decode('utf-8').lower()
             if sub.endswith(domain):
@@ -52,21 +52,20 @@ async def run_check(session, target_url, config, semaphore, result):
 
     logger.info(f"Phase: Probing {len(subdomains)} discovered subdomains with httpx...")
 
-    temp_file = f"/tmp/{domain}_subs.txt"
-    with open(temp_file, "w") as f:
-        for sub in subdomains:
-            f.write(sub + "\n")
-
-    # 3. Probe with httpx using the verified global path
+    # 3. Use the absolute path and pipe the subdomains directly to httpx
     try:
+        target_input = "\n".join(subdomains).encode()
         proc3 = await asyncio.create_subprocess_shell(
-            f"/usr/local/bin/httpx -l {temp_file} -silent -title -status-code -no-color 2>/dev/null",
+            "/usr/local/bin/httpx -silent -title -status-code -no-color",
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout3, _ = await proc3.communicate()
+        stdout3, stderr3 = await proc3.communicate(input=target_input)
         
-        # Retrieve the Subdomain dataclass from memory to avoid circular imports
+        if stderr3: 
+            logger.error(f"httpx error output: {stderr3.decode()}")
+        
         Subdomain = getattr(sys.modules.get('__main__'), 'Subdomain', None)
         
         for line in stdout3.splitlines():
@@ -78,6 +77,7 @@ async def run_check(session, target_url, config, semaphore, result):
             status = 0
             title = ""
             
+            # Simple parsing for status and title
             for part in parts[1:]:
                 if part.startswith('[') and part.endswith(']'):
                     inner = part[1:-1]
@@ -85,14 +85,10 @@ async def run_check(session, target_url, config, semaphore, result):
                     else: title = inner
             
             name = urllib.parse.urlparse(url).netloc.split(':')[0]
-            
             if Subdomain:
                 result.discovered_subdomains.append(Subdomain(name=name, status=status, title=title))
                 
     except Exception as e:
-        logger.debug(f"Httpx failed: {e}")
-        
-    if os.path.exists(temp_file):
-        os.remove(temp_file)
+        logger.error(f"httpx failed to execute: {e}")
         
     logger.info(f"Phase: Subdomain recon finished. Added {len(result.discovered_subdomains)} live targets.")
