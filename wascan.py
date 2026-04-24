@@ -6,10 +6,11 @@ Usage: python3 wascan.py <target_url> [options]
 
 import asyncio
 import argparse
-import csv
 import json
 import logging
 import os
+import pkgutil
+import importlib
 import random
 import sys
 import urllib.parse
@@ -19,7 +20,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import aiohttp
-from bs4 import BeautifulSoup
+from selectolax.parser import HTMLParser
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -34,7 +35,7 @@ logging.basicConfig(
 logger = logging.getLogger("wascan")
 
 # ==========================================
-# 2. Scan Configuration (Replaces Globals)
+# 2. Scan Configuration
 # ==========================================
 @dataclass
 class ScanConfig:
@@ -48,6 +49,7 @@ class ScanConfig:
     quiet_mode: bool = False
     max_concurrency: int = 20
 
+    # Payloads
     xss_payloads: list[str] = field(default_factory=lambda: [
         "<script>alert('XSS_CANARY')</script>",
         "<img src=x onerror=alert('XSS_CANARY')>",
@@ -60,7 +62,7 @@ class ScanConfig:
     ])
 
 # ==========================================
-# Data Structures
+# 3. Data Structures
 # ==========================================
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
@@ -81,6 +83,13 @@ class Subdomain:
     title: str = ""
 
 @dataclass
+class DiscoveredForm:
+    page_url: str
+    action: str
+    method: str
+    inputs: list[dict]
+
+@dataclass
 class ScanResult:
     target: str
     started_at: str
@@ -96,20 +105,43 @@ class ScanResult:
         return sorted(self.findings, key=lambda f: SEVERITY_ORDER.get(f.severity, 99))
 
 # ==========================================
-# Wordlists (Keep your existing arrays here)
+# 4. Utilities
 # ==========================================
-CONTENT_WORDLIST = [
-    "admin", "administrator", "api", "app", "assets", "auth", "backup",
-    # ... (Paste your existing 100+ paths here) ...
-]
+def load_wordlist(filepath: str) -> list[str]:
+    if not os.path.exists(filepath):
+        logger.warning(f"Wordlist not found: {filepath}")
+        return []
+    with open(filepath, 'r', encoding='utf-8') as f:
+        return [line.strip() for line in f if line.strip()]
 
-SUBDOMAIN_WORDLIST = [
-    "www", "mail", "ftp", "smtp", "pop", "pop3", "imap", "ns1", "ns2",
-    # ... (Paste your existing subdomain prefixes here) ...
-]
+def export_sarif(result: ScanResult, filename: str = "wascan_results.sarif"):
+    sarif_output = {
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "wascan", 
+                    "informationUri": "https://github.com/benjaminbencsik/wascan"
+                }
+            },
+            "results": []
+        }]
+    }
+    
+    for finding in result.findings:
+        sarif_output["runs"][0]["results"].append({
+            "ruleId": finding.title.replace(" ", "_").upper(),
+            "message": {"text": finding.description},
+            "locations": [{"physicalLocation": {"artifactLocation": {"uri": finding.url}}}],
+        })
+
+    with open(filename, 'w') as f:
+        json.dump(sarif_output, f, indent=2)
+    logger.info(f"Exported findings to {filename}")
 
 # ==========================================
-# 3. HTTP Helpers with Concurrency Throttling
+# 5. HTTP Helpers with Concurrency Throttling
 # ==========================================
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (wascan/2.0; security-research)",
@@ -166,15 +198,8 @@ async def fetch(
             return None
 
 # ==========================================
-# 4. Spider / Crawler Module
+# 6. Spider / Crawler Module (Selectolax)
 # ==========================================
-@dataclass
-class DiscoveredForm:
-    page_url: str
-    action: str
-    method: str
-    inputs: list[dict]
-
 async def spider(
     session: aiohttp.ClientSession, 
     base_url: str, 
@@ -186,25 +211,22 @@ async def spider(
     
     parsed_base = urllib.parse.urlparse(base_url)
     base_domain = parsed_base.netloc
-
-    visited: set[str] = set()
-    queue: list[tuple[str, int]] = [(base_url, 0)]
-    found_forms: list[DiscoveredForm] = []
+    visited = set()
+    queue = [(base_url, 0)]
+    found_forms = []
 
     def in_scope(url: str) -> bool:
         p = urllib.parse.urlparse(url)
         return p.netloc == base_domain and p.scheme in ("http", "https")
 
     def normalise(url: str, page_url: str) -> Optional[str]:
-        url = url.strip()
-        if not url or url.startswith(("#", "mailto:", "javascript:", "tel:")):
+        if not url or url.startswith(("#", "mailto:", "javascript:", "tel:")): 
             return None
-        joined = urllib.parse.urljoin(page_url, url)
-        return urllib.parse.urldefrag(joined)[0]
+        return urllib.parse.urldefrag(urllib.parse.urljoin(page_url, url.strip()))[0]
 
     while queue and len(visited) < max_pages:
         url, depth = queue.pop(0)
-        if url in visited:
+        if url in visited: 
             continue
         visited.add(url)
 
@@ -212,109 +234,19 @@ async def spider(
             logger.info(f"Crawling: {url}")
 
         resp = await fetch(session, url, config, semaphore)
-        if not resp or resp.status != 200:
-            continue
-
-        ct = resp.headers.get("Content-Type", "")
-        if "html" not in ct:
+        if not resp or resp.status != 200 or "html" not in resp.headers.get("Content-Type", ""):
             continue
 
         body = (await resp.read()).decode(errors="ignore")
-        soup = BeautifulSoup(body, "lxml")
+        tree = HTMLParser(body)
 
         if depth < max_depth:
-            for tag in soup.find_all("a", href=True):
-                norm = normalise(tag["href"], url)
+            for node in tree.css("a[href]"):
+                norm = normalise(node.attributes.get("href"), url)
                 if norm and norm not in visited and in_scope(norm):
                     queue.append((norm, depth + 1))
 
-        for form in soup.find_all("form"):
-            action = form.get("action", url)
-            action = normalise(action, url) or url
-            method = (form.get("method", "get") or "get").upper()
-            inputs = []
-            
-            for inp in form.find_all(["input", "textarea", "select"]):
-                inputs.append({
-                    "name": inp.get("name", ""),
-                    "type": inp.get("type", "text").lower(),
-                    "value": inp.get("value", ""),
-                })
-            
-            if any(i["name"] for i in inputs):
-                found_forms.append(DiscoveredForm(
-                    page_url=url, action=action, method=method, inputs=inputs
-                ))
-
-    return list(visited), found_forms
-
-# ==========================================
-# 5. Security Checks
-# ==========================================
-async def check_sensitive_files(session: aiohttp.ClientSession, base_url: str, config: ScanConfig, semaphore: asyncio.Semaphore, result: ScanResult):
-    paths = [
-        ("/.env", "Exposed .env file", "critical"),
-        ("/.git/config", "Exposed .git directory", "critical"),
-        ("/backup.sql", "Exposed database backup", "critical"),
-        ("/phpinfo.php", "PHP info page exposed", "high"),
-    ]
-    
-    for path, title, severity in paths:
-        target = urllib.parse.urljoin(base_url, path)
-        resp = await fetch(session, target, config, semaphore)
-        if resp and resp.status == 200:
-            result.add(Finding(
-                title=title,
-                severity=severity,
-                description=f"Sensitive file found at {path}",
-                url=target,
-                recommendation="Remove the file or restrict access to it."
-            ))
-
-# ==========================================
-# Core Engine
-# ==========================================
-async def run_scan(target_url: str, config: ScanConfig) -> ScanResult:
-    semaphore = asyncio.Semaphore(config.max_concurrency)
-    result = ScanResult(target=target_url, started_at=datetime.now(timezone.utc).isoformat())
-    
-    logger.info(f"Starting scan against {target_url} with concurrency {config.max_concurrency}")
-    
-    async with aiohttp.ClientSession() as session:
-        urls, forms = await spider(session, target_url, config, semaphore)
-        logger.info(f"Spider completed. Found {len(urls)} URLs and {len(forms)} forms.")
-        result.crawled_urls = urls
-        
-        # Execute checks concurrently using asyncio.gather
-        tasks = [
-            check_sensitive_files(session, target_url, config, semaphore, result),
-            # Add other remaining vulnerability checks here
-        ]
-        
-        await asyncio.gather(*tasks)
-        
-    result.finished_at = datetime.now(timezone.utc).isoformat()
-    return result
-
-# ==========================================
-# CLI Entry Point
-# ==========================================
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="wascan — Web Application Vulnerability Scanner")
-    parser.add_argument("target", help="Target URL to scan")
-    parser.add_argument("--concurrency", type=int, default=20, help="Maximum concurrent requests (default: 20)")
-    parser.add_argument("--quiet", action="store_true", help="Suppress logging output")
-    args = parser.parse_args()
-    
-    config = ScanConfig(
-        max_concurrency=args.concurrency,
-        quiet_mode=args.quiet
-    )
-    
-    if config.quiet_mode:
-        logger.setLevel(logging.WARNING)
-
-    result = asyncio.run(run_scan(args.target, config))
-    
-    if not config.quiet_mode:
-        logger.info(f"Scan complete. Found {len(result.findings)} issues.")
+        for form in tree.css("form"):
+            action = normalise(form.attributes.get("action", url), url) or url
+            method = (form.attributes.get("method", "get") or "get").upper()
+            inputs
