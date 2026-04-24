@@ -1,161 +1,255 @@
+cat << 'EOF' > wascan.py
+#!/usr/bin/env python3
+"""
+wascan — Web Application Vulnerability Scanner
+Usage: python3 wascan.py <target_url> [options]
+"""
+
 import asyncio
-import uuid
-from datetime import datetime
-from enum import Enum
+import argparse
+import json
+import logging
+import os
+import pkgutil
+import importlib
+import random
+import sys
+import urllib.parse
+import warnings
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
-from pydantic import BaseModel, HttpUrl
+import aiohttp
+from bs4 import BeautifulSoup
 
-app = FastAPI(
-    title="wascan API",
-    description="REST API for the wascan vulnerability scanner",
-    version="1.0.0",
-)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
+# ==========================================
+# 1. Standardize & Colorize Logging
+# ==========================================
+class ColorFormatter(logging.Formatter):
+    COLORS = {
+        logging.DEBUG: "\033[90m",
+        logging.INFO: "\033[94m",
+        logging.WARNING: "\033[93m",
+        logging.ERROR: "\033[91m",
+        logging.CRITICAL: "\033[1;91m"
+    }
+    RESET = "\033[0m"
 
-class ScanStatus(str, Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
+    def format(self, record):
+        log_color = self.COLORS.get(record.levelno, self.RESET)
+        format_str = f"{log_color}[%(levelname)s]{self.RESET} %(message)s"
+        formatter = logging.Formatter(format_str)
+        return formatter.format(record)
 
+logger = logging.getLogger("wascan")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(ColorFormatter())
+logger.handlers = [handler]
+logger.propagate = False
 
-class ScanProfile(str, Enum):
-    QUICK = "quick"
-    STEALTH = "stealth"
-    FULL = "full"
+# ==========================================
+# 2. Scan Configuration
+# ==========================================
+@dataclass
+class ScanConfig:
+    max_concurrency: int = 20
+    quiet_mode: bool = False
+    output_dir: str = ""
+    request_delay: float = 0.0
+    stealth_mode: bool = False
+    auth_headers: dict = field(default_factory=dict)
+    auth_cookies: dict = field(default_factory=dict)
+    proxy_url: str = ""
 
-
-class ScanCreate(BaseModel):
-    target: str
-    profile: Optional[ScanProfile] = None
-    checks: Optional[list[str]] = None
-    spider_depth: Optional[int] = 2
-    spider_pages: Optional[int] = 50
-
-
-class Finding(BaseModel):
+# ==========================================
+# 3. Data Structures
+# ==========================================
+@dataclass
+class Finding:
     title: str
     severity: str
     description: str
-    evidence: Optional[str] = ""
-    url: Optional[str] = ""
-    recommendation: Optional[str] = ""
+    url: str = ""
+    recommendation: str = ""
 
-
-class ScanResult(BaseModel):
-    id: str
+@dataclass
+class ScanResult:
     target: str
-    status: ScanStatus
     started_at: str
-    finished_at: Optional[str] = None
-    findings: list[Finding] = []
-    crawled_urls: list[str] = []
-    discovered_subdomains: list[dict] = []
+    finished_at: str = ""
+    findings: list = field(default_factory=list)
+    crawled_urls: list = field(default_factory=list)
+    discovered_subdomains: list = field(default_factory=list)
 
+    def add(self, finding: Finding): 
+        self.findings.append(finding)
 
-class ScanSummary(BaseModel):
-    id: str
-    target: str
-    status: ScanStatus
-    started_at: str
-    findings_count: int
+    def sorted_findings(self): 
+        return sorted(self.findings, key=lambda f: {"critical":0, "high":1, "medium":2, "low":3, "info":4}.get(f.severity, 99))
 
-
-scans: dict[str, ScanResult] = {}
-
-
-@app.get("/")
-async def root():
-    return {
-        "name": "wascan API",
-        "version": "1.0.0",
-        "docs": "/docs",
+# ==========================================
+# 4. Utilities
+# ==========================================
+def export_sarif(result: ScanResult, filename: str):
+    sarif_output = {
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{"tool": {"driver": {"name": "wascan"}}, "results": []}]
     }
+    for finding in result.findings:
+        sarif_output["runs"][0]["results"].append({
+            "ruleId": finding.title.replace(" ", "_").upper(),
+            "message": {"text": finding.description},
+            "locations": [{"physicalLocation": {"artifactLocation": {"uri": finding.url}}}],
+        })
+    with open(filename, 'w') as f:
+        json.dump(sarif_output, f, indent=2)
 
-
-@app.get("/scans", response_model=list[ScanSummary])
-async def list_scans(limit: int = Query(50, le=100)):
-    return [
-        ScanSummary(
-            id=sid,
-            target=scan.target,
-            status=scan.status,
-            started_at=scan.started_at,
-            findings_count=len(scan.findings),
-        )
-        for sid, scan in list(scans.items())[-limit:]
-    ]
-
-
-@app.get("/scans/{scan_id}", response_model=ScanResult)
-async def get_scan(scan_id: str):
-    if scan_id not in scans:
-        raise HTTPException(status_code=404, detail="Scan not found")
-    return scans[scan_id]
-
-
-@app.post("/scans", response_model=ScanResult, status_code=201)
-async def create_scan(scan_data: ScanCreate, background_tasks: BackgroundTasks):
-    import wascan as wascan_scanner
-
-    scan_id = str(uuid.uuid4())
-    now = datetime.utcnow().isoformat()
-
-    scans[scan_id] = ScanResult(
-        id=scan_id,
-        target=scan_data.target,
-        status=ScanStatus.PENDING,
-        started_at=now,
-    )
-
-    async def run_scan_task():
-        scans[scan_id].status = ScanStatus.RUNNING
-
+# ==========================================
+# 5. HTTP Helpers
+# ==========================================
+async def fetch(session, url, config, semaphore, method="GET", headers=None, allow_redirects=True):
+    async with semaphore:
+        merged_headers = {"User-Agent": "wascan/2.0"}
+        if headers: 
+            merged_headers.update(headers)
         try:
-            result = await wascan_scanner.run_scan(
-                target=scan_data.target,
-                checks=scan_data.checks or [],
-                spider_depth=scan_data.spider_depth,
-                spider_pages=scan_data.spider_pages,
-                subdomain_wordlist=wascan_scanner.SUBDOMAIN_WORDLIST,
-                verbose=False,
-            )
+            resp = await session.request(method, url, headers=merged_headers, allow_redirects=allow_redirects, ssl=False)
+            await resp.read()
+            return resp
+        except Exception:
+            return None
 
-            scans[scan_id].status = ScanStatus.COMPLETED
-            scans[scan_id].finished_at = result.finished_at
-            scans[scan_id].findings = [
-                Finding(
-                    title=f.title,
-                    severity=f.severity,
-                    description=f.description,
-                    evidence=f.evidence,
-                    url=f.url,
-                    recommendation=f.recommendation,
-                )
-                for f in result.sorted_findings()
-            ]
-            scans[scan_id].crawled_urls = result.crawled_urls
-            scans[scan_id].discovered_subdomains = [
-                {"name": s.name, "ip": s.ip, "status": s.status}
-                for s in result.discovered_subdomains
-            ]
-        except Exception as e:
-            scans[scan_id].status = ScanStatus.FAILED
+# ==========================================
+# 6. Spider / Crawler Module 
+# ==========================================
+async def spider(session, base_url, config, semaphore):
+    base_domain = urllib.parse.urlparse(base_url).netloc
+    visited, queue = set(), [(base_url, 0)]
 
-    background_tasks.add_task(run_scan_task)
-    return scans[scan_id]
+    while queue and len(visited) < 50:
+        url, depth = queue.pop(0)
+        if url in visited: 
+            continue
+        visited.add(url)
 
+        resp = await fetch(session, url, config, semaphore)
+        if not resp or resp.status != 200 or "html" not in resp.headers.get("Content-Type", ""):
+            continue
 
-@app.delete("/scans/{scan_id}")
-async def delete_scan(scan_id: str):
-    if scan_id not in scans:
-        raise HTTPException(status_code=404, detail="Scan not found")
-    del scans[scan_id]
-    return {"message": "Scan deleted"}
+        if depth < 2:
+            soup = BeautifulSoup((await resp.read()).decode(errors="ignore"), "lxml")
+            for tag in soup.find_all("a", href=True):
+                norm = urllib.parse.urldefrag(urllib.parse.urljoin(url, tag.get("href", "").strip()))[0]
+                if urllib.parse.urlparse(norm).netloc == base_domain and norm not in visited:
+                    queue.append((norm, depth + 1))
+                    
+    return list(visited)
 
+# ==========================================
+# 7. Dynamic Module Loader
+# ==========================================
+async def run_plugins(session, target_url, config, semaphore, result):
+    tasks = []
+    try:
+        import modules
+        for _, module_name, _ in pkgutil.iter_modules(modules.__path__):
+            if module_name in ["subdomain_recon", "archive_recon"]:
+                continue
+            mod = importlib.import_module(f"modules.{module_name}")
+            if hasattr(mod, "run_check"):
+                tasks.append(mod.run_check(session, target_url, config, semaphore, result))
+        if tasks:
+            await asyncio.gather(*tasks)
+    except ImportError:
+        pass
+
+# ==========================================
+# 8. Core Engine
+# ==========================================
+async def run_scan(target_url: str, config: ScanConfig) -> ScanResult:
+    if not target_url.startswith(("http://", "https://")):
+        target_url = f"http://{target_url}"
+        
+    domain_name = urllib.parse.urlparse(target_url).netloc.split(':')[0]
+    if domain_name.startswith("www."): 
+        domain_name = domain_name[4:]
+        
+    output_dir = os.path.join(os.getcwd(), domain_name)
+    os.makedirs(output_dir, exist_ok=True)
+    config.output_dir = output_dir
+    
+    semaphore = asyncio.Semaphore(config.max_concurrency)
+    result = ScanResult(target=target_url, started_at=datetime.now(timezone.utc).isoformat())
+    
+    logger.info(f"Starting scan against {target_url}")
+    logger.info(f"Output directory initialized at: {output_dir}")
+    
+    async with aiohttp.ClientSession() as session:
+        # Phase 1: Subdomain Recon
+        try:
+            from modules import subdomain_recon
+            if hasattr(subdomain_recon, "run_check"):
+                await subdomain_recon.run_check(session, target_url, config, semaphore, result)
+                if result.discovered_subdomains:
+                    with open(os.path.join(output_dir, "subdomains.txt"), "w") as f:
+                        for sub in result.discovered_subdomains:
+                            f.write(f"{sub.name} - {sub.ip} [{sub.status}]\n")
+        except ImportError: 
+            pass 
+
+        # Phase 1.5: Archive Recon (gau + gf)
+        try:
+            from modules import archive_recon
+            if hasattr(archive_recon, "run_check"):
+                await archive_recon.run_check(session, target_url, config, semaphore, result)
+        except ImportError: 
+            pass 
+        
+        # Phase 2: Application Spider
+        logger.info("Phase: Spidering target application...")
+        urls = await spider(session, target_url, config, semaphore)
+        for u in urls:
+            if u not in result.crawled_urls:
+                result.crawled_urls.append(u)
+                
+        logger.info(f"Phase: Spider completed. Testing {len(result.crawled_urls)} total URLs.")
+        
+        with open(os.path.join(output_dir, "crawled_urls.txt"), "w") as f:
+            for u in result.crawled_urls: 
+                f.write(u + "\n")
+        
+        # Phase 3: Active Vulnerability Scanning
+        logger.info("Phase: Executing active vulnerability plugins...")
+        await run_plugins(session, target_url, config, semaphore, result)
+        
+    result.finished_at = datetime.now(timezone.utc).isoformat()
+    export_sarif(result, os.path.join(output_dir, f"{domain_name}_results.sarif"))
+    return result
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("target")
+    parser.add_argument("--concurrency", type=int, default=20)
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args()
+    
+    config = ScanConfig(max_concurrency=args.concurrency, quiet_mode=args.quiet)
+    if config.quiet_mode:
+        logger.setLevel(logging.WARNING)
+
+    result = asyncio.run(run_scan(args.target, config))
+    
+    if not config.quiet_mode:
+        logger.info(f"Scan complete. Found {len(result.findings)} issues.")
+        for f in result.sorted_findings():
+            color = ColorFormatter.COLORS.get(logging.CRITICAL) if f.severity == "critical" else \
+                    ColorFormatter.COLORS.get(logging.ERROR) if f.severity == "high" else \
+                    ColorFormatter.COLORS.get(logging.WARNING) if f.severity == "medium" else \
+                    ColorFormatter.COLORS.get(logging.INFO)
+            print(f"{color}[{f.severity.upper()}]\033[0m {f.title} - {f.url}")
+EOF
