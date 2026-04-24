@@ -22,7 +22,7 @@ git clone https://github.com/benjaminbencsik/wascan.git
 cd wascan
 
 # Install dependencies
-pip install -r requirements.txt
+pip install -r requirements.txt --break-system-packages
 
 # Optional: install Playwright for screenshots
 pip install playwright
