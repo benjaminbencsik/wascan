@@ -25,14 +25,31 @@ from bs4 import BeautifulSoup
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # ==========================================
-# 1. Standardize Logging
+# 1. Standardize & Colorize Logging
 # ==========================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+class ColorFormatter(logging.Formatter):
+    COLORS = {
+        logging.DEBUG: "\033[90m",     # Grey
+        logging.INFO: "\033[94m",      # Blue
+        logging.WARNING: "\033[93m",   # Yellow
+        logging.ERROR: "\033[91m",     # Red
+        logging.CRITICAL: "\033[1;91m" # Bold Red
+    }
+    RESET = "\033[0m"
+
+    def format(self, record):
+        log_color = self.COLORS.get(record.levelno, self.RESET)
+        # Format string without the timestamp
+        format_str = f"{log_color}[%(levelname)s]{self.RESET} %(message)s"
+        formatter = logging.Formatter(format_str)
+        return formatter.format(record)
+
 logger = logging.getLogger("wascan")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(ColorFormatter())
+logger.handlers = [handler]
+logger.propagate = False
 
 # ==========================================
 # 2. Scan Configuration
@@ -198,7 +215,7 @@ async def fetch(
             return None
 
 # ==========================================
-# 6. Spider / Crawler Module (BeautifulSoup)
+# 6. Spider / Crawler Module 
 # ==========================================
 async def spider(
     session: aiohttp.ClientSession, 
@@ -277,6 +294,10 @@ async def run_plugins(
     try:
         import modules
         for _, module_name, _ in pkgutil.iter_modules(modules.__path__):
+            # Exclude subdomain recon since we run it in Phase 1 now
+            if module_name == "subdomain_recon":
+                continue
+                
             mod = importlib.import_module(f"modules.{module_name}")
             if hasattr(mod, "run_check"):
                 tasks.append(mod.run_check(session, target_url, config, semaphore, result))
@@ -290,17 +311,30 @@ async def run_plugins(
 # 8. Core Engine
 # ==========================================
 async def run_scan(target_url: str, config: ScanConfig) -> ScanResult:
+    # Ensure scheme is present so urllib parses it correctly
+    if not target_url.startswith(("http://", "https://")):
+        target_url = f"http://{target_url}"
+        
     semaphore = asyncio.Semaphore(config.max_concurrency)
     result = ScanResult(target=target_url, started_at=datetime.now(timezone.utc).isoformat())
     
     logger.info(f"Starting scan against {target_url} with concurrency {config.max_concurrency}")
     
     async with aiohttp.ClientSession() as session:
+        # Phase 1: Subdomain Reconnaissance
+        try:
+            from modules import subdomain_recon
+            if hasattr(subdomain_recon, "run_check"):
+                await subdomain_recon.run_check(session, target_url, config, semaphore, result)
+        except ImportError:
+            pass # Module not found, skip seamlessly
+        
+        # Phase 2: Application Spider
         urls, forms = await spider(session, target_url, config, semaphore)
         logger.info(f"Spider completed. Found {len(urls)} URLs and {len(forms)} forms.")
         result.crawled_urls = urls
         
-        # Run dynamically loaded plugins
+        # Phase 3: Active Vulnerability Scanning Plugins
         await run_plugins(session, target_url, config, semaphore, result)
         
     result.finished_at = datetime.now(timezone.utc).isoformat()
@@ -330,4 +364,9 @@ if __name__ == "__main__":
     if not config.quiet_mode:
         logger.info(f"Scan complete. Found {len(result.findings)} issues.")
         for f in result.sorted_findings():
-            logger.info(f"[{f.severity.upper()}] {f.title} - {f.url}")
+            # Apply color to the final finding output based on severity
+            color = ColorFormatter.COLORS.get(logging.CRITICAL) if f.severity == "critical" else \
+                    ColorFormatter.COLORS.get(logging.ERROR) if f.severity == "high" else \
+                    ColorFormatter.COLORS.get(logging.WARNING) if f.severity == "medium" else \
+                    ColorFormatter.COLORS.get(logging.INFO)
+            print(f"{color}[{f.severity.upper()}]\033[0m {f.title} - {f.url}")
