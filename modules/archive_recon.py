@@ -6,7 +6,7 @@ import re
 
 logger = logging.getLogger("wascan")
 
-# Native Python equivalents of popular gf patterns for categorization
+# Native Python equivalents of common gf patterns for categorizing historical data
 GF_PATTERNS = {
     "xss": re.compile(r'(?i)[?&](q|s|search|lang|keyword|query|page|q1|view|id|name)='),
     "sqli": re.compile(r'(?i)[?&](id|select|report|role|update|query|user|name|sort|where|search|params|dir|row|table|from|sel|results|sleep|fetch|order|limit|column|group|cat)='),
@@ -21,7 +21,7 @@ async def run_check(session, target_url, config, semaphore, result):
     if domain.startswith("www."):
         domain = domain[4:]
 
-    # Combine main domain and all found subdomains as targets for gau
+    # Include discovered subdomains in the targets for gau
     targets = {domain}
     if result.discovered_subdomains:
         for sub in result.discovered_subdomains:
@@ -32,9 +32,9 @@ async def run_check(session, target_url, config, semaphore, result):
     logger.info(f"Phase: Fetching historical URLs for {len(targets)} domains/subdomains via gau...")
     
     try:
-        # Run gau using the absolute path found on your system
+        # Run gau using the verified global path and piping the target list via stdin
         proc = await asyncio.create_subprocess_shell(
-            "/home/admin/go/bin/gau --threads 10 2>/dev/null",
+            "/usr/local/bin/gau --threads 10 2>/dev/null",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
@@ -75,10 +75,10 @@ async def run_check(session, target_url, config, semaphore, result):
             if urls:
                 file_path = os.path.join(config.output_dir, f"gf_{pattern_name}.txt")
                 with open(file_path, "w") as f:
-                    for u in urls: f.write(u + "\n")
+                    for u in urls:
+                        f.write(u + "\n")
                 logger.info(f"Categorized {len(urls)} URLs into gf_{pattern_name}.txt")
         
-    # Feed historical URLs into the engine's crawl list for active scanning
     for u in useful_urls:
         if u not in result.crawled_urls:
             result.crawled_urls.append(u)
