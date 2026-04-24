@@ -1,9 +1,6 @@
-aiohttp
-beautifulsoup4
-lxml
-playwright
-pytest
-pytest-asyncio
-fastapi
-uvicorn
-jinja2
+aiohttp==3.9.5
+selectolax==0.3.21
+beautifulsoup4==4.12.3
+pytest==8.2.0
+pytest-asyncio==0.23.6
+aioresponses==0.7.6
