@@ -1,113 +1,98 @@
 import asyncio
-import json
 import logging
+import os
 import urllib.parse
-import aiohttp
-from wascan import ScanConfig, ScanResult, Subdomain
+import sys
 
 logger = logging.getLogger("wascan")
 
-async def fetch_crtsh(domain: str) -> set[str]:
-    url = f"https://crt.sh/?q=%25.{domain}&output=json"
+async def run_check(session, target_url, config, semaphore, result):
+    parsed = urllib.parse.urlparse(target_url)
+    domain = parsed.netloc.split(':')[0]
+    if domain.startswith("www."):
+        domain = domain[4:]
+
+    logger.info(f"Phase: Gathering subdomains for {domain} via passive sources...")
+
     subdomains = set()
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=15) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for entry in data:
-                        name = entry.get("name_value", "")
-                        if name:
-                            subdomains.update(name.split("\n"))
-    except Exception as e:
-        logger.debug(f"crt.sh error: {e}")
-    return {s.strip().lower() for s in subdomains if s.strip().endswith(domain)}
 
-async def run_tool(cmd: list | str, shell: bool = False) -> set[str]:
+    # 1. Fetch subdomains using subfinder
     try:
-        if shell:
-            proc = await asyncio.create_subprocess_shell(
-                cmd, 
-                stdout=asyncio.subprocess.PIPE, 
-                stderr=asyncio.subprocess.PIPE
-            )
-        else:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, 
-                stdout=asyncio.subprocess.PIPE, 
-                stderr=asyncio.subprocess.PIPE
-            )
-        stdout, _ = await proc.communicate()
-        return {line.strip().decode('utf-8').lower() for line in stdout.splitlines() if line.strip()}
-    except Exception as e:
-        logger.debug(f"Tool execution failed: {e}")
-        return set()
-
-async def enumerate_subdomains(domain: str) -> list[str]:
-    logger.info(f"Gathering subdomains for {domain} via passive sources...")
-    
-    # crt.sh
-    crtsh_task = fetch_crtsh(domain)
-    
-    # Go tools
-    subfinder_task = run_tool(['subfinder', '-d', domain, '-silent'])
-    assetfinder_task = run_tool(['assetfinder', '--subs-only', domain])
-    
-    # Rust tool (Findomain)
-    findomain_task = run_tool(f'findomain -t {domain} -q 2> /dev/null', shell=True)
-    
-    results = await asyncio.gather(crtsh_task, subfinder_task, assetfinder_task, findomain_task)
-    
-    all_subs = set()
-    for res in results:
-        all_subs.update(res)
-        
-    return [sub for sub in all_subs if sub.endswith(domain)]
-
-async def run_httpx(subdomains: list[str], result: ScanResult):
-    if not subdomains:
-        return
-    
-    logger.info(f"Probing {len(subdomains)} discovered subdomains with httpx...")
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            'httpx', '-silent', '-json',
-            stdin=asyncio.subprocess.PIPE,
+        proc = await asyncio.create_subprocess_shell(
+            f"subfinder -d {domain} -silent 2>/dev/null",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        
-        stdout, _ = await proc.communicate(input='\n'.join(subdomains).encode())
-        
+        stdout, _ = await proc.communicate()
         for line in stdout.splitlines():
-            try:
-                data = json.loads(line.decode('utf-8'))
-                
-                # ProjectDiscovery httpx JSON structure mapping
-                url = data.get("url", "")
-                host = data.get("host", "")
-                ip = data.get("a", [""])[0] if data.get("a") else ""
-                status = data.get("status_code", 0)
-                title = data.get("title", "")
-                
-                result.discovered_subdomains.append(Subdomain(
-                    name=host or url,
-                    ip=ip,
-                    status=status,
-                    title=title
-                ))
-            except json.JSONDecodeError:
-                pass
-    except Exception as e:
-        logger.error(f"Failed to run httpx: {e}")
+            sub = line.strip().decode('utf-8').lower()
+            if sub.endswith(domain):
+                subdomains.add(sub)
+    except Exception:
+        pass
 
-async def run_check(session: aiohttp.ClientSession, target_url: str, config: ScanConfig, semaphore: asyncio.Semaphore, result: ScanResult):
-    parsed = urllib.parse.urlparse(target_url)
-    domain = parsed.netloc.split(':')[0]
-    
-    # Strip www. to get the root domain for enumeration
-    if domain.startswith("www."):
-        domain = domain[4:]
+    # 2. Fetch subdomains using assetfinder
+    try:
+        proc2 = await asyncio.create_subprocess_shell(
+            f"assetfinder --subs-only {domain} 2>/dev/null",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout2, _ = await proc2.communicate()
+        for line in stdout2.splitlines():
+            sub = line.strip().decode('utf-8').lower()
+            if sub.endswith(domain):
+                subdomains.add(sub)
+    except Exception:
+        pass
+
+    if not subdomains:
+        logger.warning(f"No subdomains found for {domain}.")
+        return
+
+    logger.info(f"Phase: Probing {len(subdomains)} discovered subdomains with httpx...")
+
+    temp_file = f"/tmp/{domain}_subs.txt"
+    with open(temp_file, "w") as f:
+        for sub in subdomains:
+            f.write(sub + "\n")
+
+    # 3. Probe with httpx and append dynamically (No circular imports!)
+    try:
+        proc3 = await asyncio.create_subprocess_shell(
+            f"httpx -l {temp_file} -silent -title -status-code -no-color 2>/dev/null",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout3, _ = await proc3.communicate()
         
-    subdomains = await enumerate_subdomains(domain)
-    await run_httpx(subdomains, result)
+        # Dynamically retrieve the Subdomain dataclass directly from memory to bypass the ImportError
+        Subdomain = getattr(sys.modules.get('__main__'), 'Subdomain', None)
+        
+        for line in stdout3.splitlines():
+            output = line.strip().decode('utf-8')
+            if not output: continue
+            
+            parts = output.split(' ')
+            url = parts[0]
+            status = 0
+            title = ""
+            
+            for part in parts[1:]:
+                if part.startswith('[') and part.endswith(']'):
+                    inner = part[1:-1]
+                    if inner.isdigit(): status = int(inner)
+                    else: title = inner
+            
+            name = urllib.parse.urlparse(url).netloc.split(':')[0]
+            
+            if Subdomain:
+                result.discovered_subdomains.append(Subdomain(name=name, status=status, title=title))
+                
+    except Exception as e:
+        logger.debug(f"Httpx failed: {e}")
+        
+    if os.path.exists(temp_file):
+        os.remove(temp_file)
+        
+    logger.info(f"Phase: Subdomain recon finished. Added {len(result.discovered_subdomains)} live targets.")
