@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import aiohttp
-from selectolax.parser import HTMLParser
+from bs4 import BeautifulSoup
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -198,7 +198,7 @@ async def fetch(
             return None
 
 # ==========================================
-# 6. Spider / Crawler Module (Selectolax)
+# 6. Spider / Crawler Module (BeautifulSoup)
 # ==========================================
 async def spider(
     session: aiohttp.ClientSession, 
@@ -238,15 +238,96 @@ async def spider(
             continue
 
         body = (await resp.read()).decode(errors="ignore")
-        tree = HTMLParser(body)
+        soup = BeautifulSoup(body, "lxml")
 
         if depth < max_depth:
-            for node in tree.css("a[href]"):
-                norm = normalise(node.attributes.get("href"), url)
+            for tag in soup.find_all("a", href=True):
+                norm = normalise(tag.get("href"), url)
                 if norm and norm not in visited and in_scope(norm):
                     queue.append((norm, depth + 1))
 
-        for form in tree.css("form"):
-            action = normalise(form.attributes.get("action", url), url) or url
-            method = (form.attributes.get("method", "get") or "get").upper()
-            inputs
+        for form in soup.find_all("form"):
+            action = normalise(form.get("action", url), url) or url
+            method = (form.get("method", "get") or "get").upper()
+            inputs = []
+            
+            for inp in form.find_all(["input", "textarea", "select"]):
+                inputs.append({
+                    "name": inp.get("name", ""),
+                    "type": inp.get("type", "text").lower(),
+                    "value": inp.get("value", ""),
+                })
+            
+            if any(i["name"] for i in inputs):
+                found_forms.append(DiscoveredForm(page_url=url, action=action, method=method, inputs=inputs))
+
+    return list(visited), found_forms
+
+# ==========================================
+# 7. Dynamic Module Loader
+# ==========================================
+async def run_plugins(
+    session: aiohttp.ClientSession, 
+    target_url: str, 
+    config: ScanConfig, 
+    semaphore: asyncio.Semaphore, 
+    result: ScanResult
+):
+    tasks = []
+    try:
+        import modules
+        for _, module_name, _ in pkgutil.iter_modules(modules.__path__):
+            mod = importlib.import_module(f"modules.{module_name}")
+            if hasattr(mod, "run_check"):
+                tasks.append(mod.run_check(session, target_url, config, semaphore, result))
+        
+        if tasks:
+            await asyncio.gather(*tasks)
+    except ImportError:
+        logger.warning("No 'modules' package found. Create a 'modules/' directory with an '__init__.py' file to enable plugins.")
+
+# ==========================================
+# 8. Core Engine
+# ==========================================
+async def run_scan(target_url: str, config: ScanConfig) -> ScanResult:
+    semaphore = asyncio.Semaphore(config.max_concurrency)
+    result = ScanResult(target=target_url, started_at=datetime.now(timezone.utc).isoformat())
+    
+    logger.info(f"Starting scan against {target_url} with concurrency {config.max_concurrency}")
+    
+    async with aiohttp.ClientSession() as session:
+        urls, forms = await spider(session, target_url, config, semaphore)
+        logger.info(f"Spider completed. Found {len(urls)} URLs and {len(forms)} forms.")
+        result.crawled_urls = urls
+        
+        # Run dynamically loaded plugins
+        await run_plugins(session, target_url, config, semaphore, result)
+        
+    result.finished_at = datetime.now(timezone.utc).isoformat()
+    export_sarif(result)
+    return result
+
+# ==========================================
+# 9. CLI Entry Point
+# ==========================================
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="wascan — Web Application Vulnerability Scanner")
+    parser.add_argument("target", help="Target URL to scan")
+    parser.add_argument("--concurrency", type=int, default=20, help="Maximum concurrent requests (default: 20)")
+    parser.add_argument("--quiet", action="store_true", help="Suppress logging output")
+    args = parser.parse_args()
+    
+    config = ScanConfig(
+        max_concurrency=args.concurrency,
+        quiet_mode=args.quiet
+    )
+    
+    if config.quiet_mode:
+        logger.setLevel(logging.WARNING)
+
+    result = asyncio.run(run_scan(args.target, config))
+    
+    if not config.quiet_mode:
+        logger.info(f"Scan complete. Found {len(result.findings)} issues.")
+        for f in result.sorted_findings():
+            logger.info(f"[{f.severity.upper()}] {f.title} - {f.url}")
