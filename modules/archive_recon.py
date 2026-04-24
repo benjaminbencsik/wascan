@@ -6,7 +6,6 @@ import re
 
 logger = logging.getLogger("wascan")
 
-# Native Python equivalents of Tomnomnom's most popular gf patterns
 GF_PATTERNS = {
     "xss": re.compile(r'(?i)[?&](q|s|search|lang|keyword|query|page|q1|view|id|name)='),
     "sqli": re.compile(r'(?i)[?&](id|select|report|role|update|query|user|name|sort|where|search|params|dir|row|table|from|sel|results|sleep|fetch|order|limit|column|group|cat)='),
@@ -21,16 +20,26 @@ async def run_check(session, target_url, config, semaphore, result):
     if domain.startswith("www."):
         domain = domain[4:]
 
-    logger.info(f"Phase: Fetching historical URLs for {domain} via gau...")
+    # 1. Gather the main domain PLUS all discovered subdomains
+    targets = {domain}
+    if result.discovered_subdomains:
+        for sub in result.discovered_subdomains:
+            targets.add(sub.name)
+            
+    # Convert the set of targets into a newline-separated string
+    target_list_str = "\n".join(targets)
+
+    logger.info(f"Phase: Fetching historical URLs for {len(targets)} domains/subdomains via gau...")
     
     try:
-        # Run gau on the domain and silence stderr
+        # 2. Feed the target list directly into gau via standard input
         proc = await asyncio.create_subprocess_shell(
-            f"gau {domain} --threads 10 2>/dev/null",
+            "gau --threads 10 2>/dev/null",
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, _ = await proc.communicate()
+        stdout, _ = await proc.communicate(input=target_list_str.encode())
         historical_urls = set(line.strip().decode('utf-8') for line in stdout.splitlines() if line.strip())
     except Exception as e:
         logger.debug(f"Failed to run gau: {e}")
@@ -42,47 +51,33 @@ async def run_check(session, target_url, config, semaphore, result):
 
     useful_urls = set()
     gf_results = {key: set() for key in GF_PATTERNS}
-    
-    # Ignore static assets that are useless for active injection scanning
     excluded_exts = ('.jpg', '.jpeg', '.png', '.gif', '.css', '.woff', '.woff2', '.svg', '.ttf', '.js', '.ico')
     
     for url in historical_urls:
         try:
             p = urllib.parse.urlparse(url)
-            if p.path.lower().endswith(excluded_exts):
-                continue
-                
-            # We ONLY want URLs that contain query parameters
+            if p.path.lower().endswith(excluded_exts): continue
             if p.query:
                 useful_urls.add(url)
-                
-                # Apply our native gf patterns to categorize the URL
                 for pattern_name, regex in GF_PATTERNS.items():
                     if regex.search(url):
                         gf_results[pattern_name].add(url)
-        except:
-            pass
+        except: pass
             
     logger.info(f"Found {len(useful_urls)} historical URLs containing query parameters.")
     
     if config.output_dir and useful_urls:
-        # 1. Save the master list of parameters
         archive_file = os.path.join(config.output_dir, "historical_parameters.txt")
         with open(archive_file, "w") as f:
-            for u in useful_urls:
-                f.write(u + "\n")
-        logger.info(f"Saved master parameter list to historical_parameters.txt")
+            for u in useful_urls: f.write(u + "\n")
         
-        # 2. Save the GF pattern specific lists
         for pattern_name, urls in gf_results.items():
             if urls:
                 file_path = os.path.join(config.output_dir, f"gf_{pattern_name}.txt")
                 with open(file_path, "w") as f:
-                    for u in urls:
-                        f.write(u + "\n")
+                    for u in urls: f.write(u + "\n")
                 logger.info(f"Categorized {len(urls)} URLs into gf_{pattern_name}.txt")
         
-    # 3. Feed these parameter-heavy URLs directly into the active scanning queue
     for u in useful_urls:
         if u not in result.crawled_urls:
             result.crawled_urls.append(u)
