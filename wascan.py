@@ -39,7 +39,6 @@ class ColorFormatter(logging.Formatter):
 
     def format(self, record):
         log_color = self.COLORS.get(record.levelno, self.RESET)
-        # Format string without the timestamp
         format_str = f"{log_color}[%(levelname)s]{self.RESET} %(message)s"
         formatter = logging.Formatter(format_str)
         return formatter.format(record)
@@ -203,7 +202,7 @@ async def fetch(
         )
         
         if config.proxy_url:
-            kwargs["proxy"] = config.proxy_url
+            kwargs["proxy"] = kwargs["proxy"] = config.proxy_url
 
         try:
             resp = await session.request(method, url, **kwargs)
@@ -247,8 +246,7 @@ async def spider(
             continue
         visited.add(url)
 
-        if not config.quiet_mode:
-            logger.info(f"Crawling: {url}")
+        # Removed the per-URL logging here to keep the terminal clean
 
         resp = await fetch(session, url, config, semaphore)
         if not resp or resp.status != 200 or "html" not in resp.headers.get("Content-Type", ""):
@@ -325,16 +323,19 @@ async def run_scan(target_url: str, config: ScanConfig) -> ScanResult:
         try:
             from modules import subdomain_recon
             if hasattr(subdomain_recon, "run_check"):
+                # The subdomain_recon module handles its own high-level logging
                 await subdomain_recon.run_check(session, target_url, config, semaphore, result)
         except ImportError:
-            pass # Module not found, skip seamlessly
+            pass 
         
         # Phase 2: Application Spider
+        logger.info("Phase: Spidering target application...")
         urls, forms = await spider(session, target_url, config, semaphore)
-        logger.info(f"Spider completed. Found {len(urls)} URLs and {len(forms)} forms.")
+        logger.info(f"Phase: Spider completed. Found {len(urls)} URLs and {len(forms)} forms.")
         result.crawled_urls = urls
         
         # Phase 3: Active Vulnerability Scanning Plugins
+        logger.info("Phase: Executing active vulnerability scanning plugins...")
         await run_plugins(session, target_url, config, semaphore, result)
         
     result.finished_at = datetime.now(timezone.utc).isoformat()
