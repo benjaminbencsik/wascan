@@ -18,8 +18,8 @@ A comprehensive, asynchronous web application security scanner that detects OWAS
 
 ```bash
 # Clone or download the scanner
-git clone https://github.com/yourrepo/vulnscan.git
-cd vulnscan
+git clone https://github.com/benjaminbencsik/wascan.git
+cd wascan
 
 # Install dependencies
 pip install -r requirements.txt
