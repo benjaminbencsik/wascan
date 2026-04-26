@@ -76,6 +76,9 @@ class ScanResult:
     crawled_urls: list = field(default_factory=list)
     discovered_subdomains: list = field(default_factory=list)
 
+    def add(self, finding: Finding):
+        self.findings.append(finding)
+
     def sorted_findings(self): 
         return sorted(self.findings, key=lambda f: {"critical":0, "high":1, "medium":2, "low":3, "info":4}.get(f.severity, 99))
 
