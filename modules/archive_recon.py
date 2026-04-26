@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import urllib.parse
-import re
 import shutil
 
 logger = logging.getLogger("wascan")
@@ -11,12 +10,12 @@ async def run_check(session, target_url, config, semaphore, result):
     domain = parsed.netloc.split(':')[0]
     if domain.startswith("www."): domain = domain[4:]
 
-    # Use EVERY subdomain we found, not just the ones httpx liked
+    # Fetch root domain PLUS the robust list of subdomains we safely stored
     targets = {domain}
-    # This logic ensures we don't just have '1 domain'
     if hasattr(result, 'discovered_subdomains'):
         for sub in result.discovered_subdomains:
-            targets.add(sub.name)
+            if hasattr(sub, 'name'):
+                targets.add(sub.name)
             
     target_list_str = "\n".join(targets)
     logger.info(f"Phase: Fetching historical URLs for {len(targets)} domains/subdomains via gau...")
@@ -34,13 +33,24 @@ async def run_check(session, target_url, config, semaphore, result):
         stdout, _ = await proc.communicate(input=target_list_str.encode())
         historical_urls = set(line.strip().decode('utf-8') for line in stdout.splitlines() if line.strip())
         
-        if historical_urls:
-            logger.info(f"Found {len(historical_urls)} historical URLs. Adding to crawl list.")
-            for u in historical_urls:
+        useful_urls = set()
+        excluded_exts = ('.jpg', '.jpeg', '.png', '.gif', '.css', '.woff', '.woff2', '.svg', '.ttf', '.js', '.ico')
+        
+        for url in historical_urls:
+            try:
+                p = urllib.parse.urlparse(url)
+                if p.path.lower().endswith(excluded_exts): continue
+                if p.query:
+                    useful_urls.add(url)
+            except: pass
+        
+        if useful_urls:
+            logger.info(f"Found {len(useful_urls)} historical URLs with parameters. Adding to attack queue.")
+            for u in useful_urls:
                 if u not in result.crawled_urls:
                     result.crawled_urls.append(u)
         else:
-            logger.warning("gau returned 0 URLs.")
+            logger.warning("gau returned 0 viable URLs.")
             
     except Exception as e:
         logger.error(f"gau failed: {e}")
