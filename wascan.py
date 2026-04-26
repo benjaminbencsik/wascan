@@ -191,6 +191,54 @@ async def execute_archive_recon(domain: str, result: ScanResult, output_dir: str
     except Exception as e:
         logger.error(f"gau execution failed: {e}")
 
+async def execute_nuclei_scan(result: ScanResult):
+    targets = set()
+    # Feed it all parameterized URLs discovered
+    for u in result.crawled_urls:
+        targets.add(u)
+    # Feed it all live subdomains discovered
+    for sub in result.discovered_subdomains:
+        if hasattr(sub, 'name'):
+            targets.add(f"http://{sub.name}")
+            targets.add(f"https://{sub.name}")
+
+    if not targets:
+        return
+
+    nuclei_path = shutil.which("nuclei")
+    if not nuclei_path:
+        logger.warning("nuclei not found in system PATH. Skipping.")
+        return
+
+    logger.info(f"Phase: Executing Nuclei templates against {len(targets)} targets...")
+    target_list_str = "\n".join(targets)
+
+    try:
+        # Run nuclei silently and output strictly in JSON for Python to ingest
+        proc = await asyncio.create_subprocess_shell(
+            f"{nuclei_path} -silent -json",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await proc.communicate(input=target_list_str.encode())
+        
+        for line in stdout.splitlines():
+            output = line.strip().decode('utf-8')
+            if not output: continue
+            try:
+                data = json.loads(output)
+                info = data.get("info", {})
+                title = info.get("name", "Nuclei Finding")
+                severity = info.get("severity", "info")
+                desc = info.get("description", "No description provided.")
+                url = data.get("matched-at", data.get("host", ""))
+                
+                # Append to our main memory state so it renders flawlessly at the end
+                result.findings.append(Finding(title=title, severity=severity, description=desc, url=url))
+            except json.JSONDecodeError:
+                pass
+    except Exception as e:
+        logger.error(f"Nuclei execution failed: {e}")
+
 # ==========================================
 # 3. Crawler & Plugin Engine
 # ==========================================
@@ -235,7 +283,6 @@ async def run_plugins(session, target_url, config, semaphore, result):
     try:
         import modules
         for _, module_name, _ in pkgutil.iter_modules(modules.__path__):
-            # Skip the old separated recon modules if they still exist in the folder
             if module_name in ["subdomain_recon", "archive_recon"]: continue
             mod = importlib.import_module(f"modules.{module_name}")
             if hasattr(mod, "run_check"):
@@ -261,7 +308,7 @@ async def run_scan(target_url: str, config: ScanConfig) -> ScanResult:
     logger.info(f"Starting scan against {target_url}")
     logger.info(f"Output directory initialized at: {output_dir}")
     
-    # Run the built-in Recon Phases
+    # Recon Phases
     await execute_subdomain_recon(domain, result)
     await execute_archive_recon(domain, result, output_dir)
     
@@ -277,8 +324,12 @@ async def run_scan(target_url: str, config: ScanConfig) -> ScanResult:
         with open(os.path.join(output_dir, "crawled_urls.txt"), "w") as f:
             for u in result.crawled_urls: f.write(u + "\n")
         
+        # Attack Phases
         logger.info("Phase: Executing active vulnerability plugins...")
         await run_plugins(session, target_url, config, semaphore, result)
+        
+        # Nuclei Integration
+        await execute_nuclei_scan(result)
         
     result.finished_at = datetime.now(timezone.utc).isoformat()
     return result
