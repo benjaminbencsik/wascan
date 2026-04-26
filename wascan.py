@@ -88,8 +88,8 @@ async def execute_subdomain_recon(domain: str, result: ScanResult):
 
     # Passive Gathering 
     cmds = [
-        f"subfinder -d {domain} -silent",
-        f"assetfinder --subs-only {domain}",
+        f"subfinder -d {domain} -silent 2> /dev/null",
+        f"assetfinder --subs-only {domain} 2> /dev/null",
         f"findomain -t {domain} -q 2> /dev/null"
     ]
     
@@ -162,7 +162,7 @@ async def execute_archive_recon(domain: str, result: ScanResult, output_dir: str
 
     try:
         proc = await asyncio.create_subprocess_shell(
-            f"{gau_path} --threads 10",
+            f"{gau_path} --threads 10 2> /dev/null",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         stdout, _ = await proc.communicate(input=target_list_str.encode())
@@ -194,10 +194,20 @@ async def execute_archive_recon(domain: str, result: ScanResult, output_dir: str
 # ==========================================
 # 3. Crawler & Plugin Engine
 # ==========================================
-async def fetch(session, url, config, semaphore, method="GET"):
+async def fetch(session, url, config, semaphore, method="GET", headers=None, allow_redirects=True, **kwargs):
     async with semaphore:
+        merged_headers = {"User-Agent": "wascan/3.0"}
+        if headers:
+            merged_headers.update(headers)
         try:
-            resp = await session.request(method, url, headers={"User-Agent": "wascan/3.0"}, allow_redirects=True, ssl=False)
+            resp = await session.request(
+                method, 
+                url, 
+                headers=merged_headers, 
+                allow_redirects=allow_redirects, 
+                ssl=False, 
+                **kwargs
+            )
             await resp.read()
             return resp
         except Exception:
