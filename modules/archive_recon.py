@@ -1,18 +1,10 @@
 import asyncio
 import logging
-import os
 import urllib.parse
-import re
+import sys
+import shutil
 
 logger = logging.getLogger("wascan")
-
-GF_PATTERNS = {
-    "xss": re.compile(r'(?i)[?&](q|s|search|lang|keyword|query|page|q1|view|id|name)='),
-    "sqli": re.compile(r'(?i)[?&](id|select|report|role|update|query|user|name|sort|where|search|params|dir|row|table|from|sel|results|sleep|fetch|order|limit|column|group|cat)='),
-    "ssrf": re.compile(r'(?i)[?&](dest|redirect|uri|path|continue|url|window|next|data|reference|site|html|val|validate|domain|callback|return|page|feed|host|port|to|out|view|dir|show|navigation|open)='),
-    "lfi": re.compile(r'(?i)[?&](file|document|folder|root|path|pg|style|pdf|template|dir|ret|download|log|doc)='),
-    "redirect": re.compile(r'(?i)[?&](redirect|redirect_to|redirect_uri|url|return|return_to|next|continue|dest|destination|goto)=')
-}
 
 async def run_check(session, target_url, config, semaphore, result):
     parsed = urllib.parse.urlparse(target_url)
@@ -20,64 +12,84 @@ async def run_check(session, target_url, config, semaphore, result):
     if domain.startswith("www."):
         domain = domain[4:]
 
-    # Feed the root domain PLUS all live subdomains to gau
-    targets = {domain}
-    for sub in result.discovered_subdomains:
-        targets.add(sub.name)
-            
-    target_list_str = "\n".join(targets)
+    logger.info(f"Phase: Gathering subdomains for {domain} via passive sources...")
 
-    logger.info(f"Phase: Fetching historical URLs for {len(targets)} domains/subdomains via gau...")
-    
+    subdomains = set()
+
+    # 1. Fetch subdomains using subfinder
     try:
         proc = await asyncio.create_subprocess_shell(
-            "/usr/local/bin/gau --threads 10",
+            f"subfinder -d {domain} -silent",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await proc.communicate()
+        for line in stdout.splitlines():
+            sub = line.strip().decode('utf-8').lower()
+            if sub.endswith(domain):
+                subdomains.add(sub)
+    except Exception:
+        pass
+
+    # 2. Fetch subdomains using assetfinder
+    try:
+        proc2 = await asyncio.create_subprocess_shell(
+            f"assetfinder --subs-only {domain}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout2, _ = await proc2.communicate()
+        for line in stdout2.splitlines():
+            sub = line.strip().decode('utf-8').lower()
+            if sub.endswith(domain):
+                subdomains.add(sub)
+    except Exception:
+        pass
+
+    if not subdomains:
+        logger.warning(f"No subdomains found for {domain}.")
+        return
+
+    logger.info(f"Phase: Probing {len(subdomains)} discovered subdomains with httpx...")
+
+    # 3. DYNAMIC PATH DISCOVERY
+    httpx_path = shutil.which("httpx")
+    if not httpx_path:
+        logger.error("httpx not found in system PATH.")
+        return
+
+    try:
+        target_input = "\n".join(subdomains).encode()
+        proc3 = await asyncio.create_subprocess_shell(
+            f"{httpx_path} -silent -title -status-code -no-color",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, stderr = await proc.communicate(input=target_list_str.encode())
+        stdout3, stderr3 = await proc3.communicate(input=target_input)
         
-        if stderr: logger.debug(f"gau error: {stderr.decode()}")
+        Subdomain = getattr(sys.modules.get('__main__'), 'Subdomain', None)
         
-        historical_urls = set(line.strip().decode('utf-8') for line in stdout.splitlines() if line.strip())
-    except Exception as e:
-        logger.error(f"Failed to run gau: {e}")
-        historical_urls = set()
-
-    if not historical_urls:
-        logger.warning("No historical URLs found via gau.")
-        return
-
-    useful_urls = set()
-    gf_results = {key: set() for key in GF_PATTERNS}
-    excluded_exts = ('.jpg', '.jpeg', '.png', '.gif', '.css', '.woff', '.woff2', '.svg', '.ttf', '.js', '.ico')
-    
-    for url in historical_urls:
-        try:
-            p = urllib.parse.urlparse(url)
-            if p.path.lower().endswith(excluded_exts): continue
-            if p.query:
-                useful_urls.add(url)
-                for pattern_name, regex in GF_PATTERNS.items():
-                    if regex.search(url):
-                        gf_results[pattern_name].add(url)
-        except: pass
+        for line in stdout3.splitlines():
+            output = line.strip().decode('utf-8')
+            if not output: continue
             
-    logger.info(f"Found {len(useful_urls)} historical URLs containing query parameters.")
-    
-    if config.output_dir and useful_urls:
-        archive_file = os.path.join(config.output_dir, "historical_parameters.txt")
-        with open(archive_file, "w") as f:
-            for u in useful_urls: f.write(u + "\n")
+            parts = output.split(' ')
+            url = parts[0]
+            status = 0
+            title = ""
+            
+            for part in parts[1:]:
+                if part.startswith('[') and part.endswith(']'):
+                    inner = part[1:-1]
+                    if inner.isdigit(): status = int(inner)
+                    else: title = inner
+            
+            name = urllib.parse.urlparse(url).netloc.split(':')[0]
+            if Subdomain:
+                result.discovered_subdomains.append(Subdomain(name=name, status=status, title=title))
+                
+    except Exception as e:
+        logger.error(f"httpx failed: {e}")
         
-        for pattern_name, urls in gf_results.items():
-            if urls:
-                file_path = os.path.join(config.output_dir, f"gf_{pattern_name}.txt")
-                with open(file_path, "w") as f:
-                    for u in urls: f.write(u + "\n")
-                logger.info(f"Categorized {len(urls)} URLs into gf_{pattern_name}.txt")
-        
-    for u in useful_urls:
-        if u not in result.crawled_urls:
-            result.crawled_urls.append(u)
+    logger.info(f"Phase: Subdomain recon finished. Added {len(result.discovered_subdomains)} live targets.")
