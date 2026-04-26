@@ -2,6 +2,7 @@ import asyncio
 import logging
 import urllib.parse
 import sys
+import shutil
 
 logger = logging.getLogger("wascan")
 
@@ -22,14 +23,13 @@ async def run_check(session, target_url, config, semaphore, result):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout, stderr = await proc.communicate()
-        if stderr: logger.debug(f"Subfinder error: {stderr.decode()}")
+        stdout, _ = await proc.communicate()
         for line in stdout.splitlines():
             sub = line.strip().decode('utf-8').lower()
             if sub.endswith(domain):
                 subdomains.add(sub)
-    except Exception as e:
-        logger.debug(f"Subfinder execution failed: {e}")
+    except Exception:
+        pass
 
     # 2. Fetch subdomains using assetfinder
     try:
@@ -38,7 +38,7 @@ async def run_check(session, target_url, config, semaphore, result):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        stdout2, stderr2 = await proc2.communicate()
+        stdout2, _ = await proc2.communicate()
         for line in stdout2.splitlines():
             sub = line.strip().decode('utf-8').lower()
             if sub.endswith(domain):
@@ -52,19 +52,21 @@ async def run_check(session, target_url, config, semaphore, result):
 
     logger.info(f"Phase: Probing {len(subdomains)} discovered subdomains with httpx...")
 
-    # 3. Use the absolute path and pipe the subdomains directly to httpx
+    # 3. DYNAMIC PATH DISCOVERY
+    httpx_path = shutil.which("httpx")
+    if not httpx_path:
+        logger.error("httpx not found in system PATH.")
+        return
+
     try:
         target_input = "\n".join(subdomains).encode()
         proc3 = await asyncio.create_subprocess_shell(
-            "/usr/local/bin/httpx -silent -title -status-code -no-color",
+            f"{httpx_path} -silent -title -status-code -no-color",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         stdout3, stderr3 = await proc3.communicate(input=target_input)
-        
-        if stderr3: 
-            logger.error(f"httpx error output: {stderr3.decode()}")
         
         Subdomain = getattr(sys.modules.get('__main__'), 'Subdomain', None)
         
@@ -77,7 +79,6 @@ async def run_check(session, target_url, config, semaphore, result):
             status = 0
             title = ""
             
-            # Simple parsing for status and title
             for part in parts[1:]:
                 if part.startswith('[') and part.endswith(']'):
                     inner = part[1:-1]
@@ -89,6 +90,6 @@ async def run_check(session, target_url, config, semaphore, result):
                 result.discovered_subdomains.append(Subdomain(name=name, status=status, title=title))
                 
     except Exception as e:
-        logger.error(f"httpx failed to execute: {e}")
+        logger.error(f"httpx failed: {e}")
         
     logger.info(f"Phase: Subdomain recon finished. Added {len(result.discovered_subdomains)} live targets.")
