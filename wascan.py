@@ -193,10 +193,8 @@ async def execute_archive_recon(domain: str, result: ScanResult, output_dir: str
 
 async def execute_nuclei_scan(result: ScanResult):
     targets = set()
-    # Feed it all parameterized URLs discovered
     for u in result.crawled_urls:
         targets.add(u)
-    # Feed it all live subdomains discovered
     for sub in result.discovered_subdomains:
         if hasattr(sub, 'name'):
             targets.add(f"http://{sub.name}")
@@ -214,7 +212,6 @@ async def execute_nuclei_scan(result: ScanResult):
     target_list_str = "\n".join(targets)
 
     try:
-        # Run nuclei silently and output strictly in JSON for Python to ingest
         proc = await asyncio.create_subprocess_shell(
             f"{nuclei_path} -silent -json",
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -232,7 +229,6 @@ async def execute_nuclei_scan(result: ScanResult):
                 desc = info.get("description", "No description provided.")
                 url = data.get("matched-at", data.get("host", ""))
                 
-                # Append to our main memory state so it renders flawlessly at the end
                 result.findings.append(Finding(title=title, severity=severity, description=desc, url=url))
             except json.JSONDecodeError:
                 pass
@@ -310,14 +306,32 @@ async def run_scan(target_url: str, config: ScanConfig) -> ScanResult:
     
     # Recon Phases
     await execute_subdomain_recon(domain, result)
+
+    if result.discovered_subdomains:
+        live_urls_path = os.path.join(output_dir, "live_urls.txt")
+        with open(live_urls_path, "w") as f:
+            for sub in result.discovered_subdomains:
+                if hasattr(sub, 'name'):
+                    f.write(f"http://{sub.name}\n")
+                    f.write(f"https://{sub.name}\n")
+
     await execute_archive_recon(domain, result, output_dir)
     
     async with aiohttp.ClientSession() as session:
-        logger.info("Phase: Spidering target application...")
-        urls = await spider(session, target_url, config, semaphore)
-        for u in urls:
-            if u not in result.crawled_urls:
-                result.crawled_urls.append(u)
+        logger.info(f"Phase: Spidering target application and {len(result.discovered_subdomains)} subdomains...")
+        
+        spider_tasks = [spider(session, target_url, config, semaphore)]
+        
+        for sub in result.discovered_subdomains:
+            if hasattr(sub, 'name'):
+                spider_tasks.append(spider(session, f"http://{sub.name}", config, semaphore))
+                
+        spider_results = await asyncio.gather(*spider_tasks)
+        
+        for urls in spider_results:
+            for u in urls:
+                if u not in result.crawled_urls:
+                    result.crawled_urls.append(u)
                 
         logger.info(f"Phase: Spider completed. Testing {len(result.crawled_urls)} total URLs.")
         
